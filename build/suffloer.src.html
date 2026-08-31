@@ -1541,24 +1541,38 @@ function hashKey(s) {
 
 // Google Cloud Text-to-Speech (browser, API-key auth). Key stays on this device.
 const gtts = {
+  // Only voice names that have existed in Google Cloud TTS for years — safe blind defaults.
   FALLBACK_VOICES: [
     { name: "da-DK-Wavenet-A", gender: "FEMALE" },
     { name: "da-DK-Wavenet-C", gender: "MALE" },
     { name: "da-DK-Wavenet-D", gender: "FEMALE" },
-    { name: "da-DK-Wavenet-E", gender: "FEMALE" },
-    { name: "da-DK-Neural2-D", gender: "FEMALE" },
+    { name: "da-DK-Wavenet-E", gender: "MALE" },
     { name: "da-DK-Standard-A", gender: "FEMALE" },
     { name: "da-DK-Standard-C", gender: "MALE" },
     { name: "da-DK-Standard-D", gender: "FEMALE" },
-    { name: "da-DK-Standard-E", gender: "FEMALE" },
+    { name: "da-DK-Standard-E", gender: "MALE" },
   ],
   voices: [],
+  _badVoices: new Set(),
   get key() { try { return localStorage.getItem("suffloer.gkey") || ""; } catch (e) { return ""; } },
   set key(v) { try { v ? localStorage.setItem("suffloer.gkey", v) : localStorage.removeItem("suffloer.gkey"); } catch (e) {} },
   get on() { try { return localStorage.getItem("suffloer.gon") === "1"; } catch (e) { return false; } },
   set on(v) { try { localStorage.setItem("suffloer.gon", v ? "1" : "0"); } catch (e) {} },
   enabled() { return this.on && !!this.key; },
-  voiceList() { return this.voices.length ? this.voices : this.FALLBACK_VOICES; },
+  loadCachedVoices() {
+    try {
+      const raw = localStorage.getItem("suffloer.gvoices");
+      if (raw) { const a = JSON.parse(raw); if (Array.isArray(a) && a.length) this.voices = a; }
+    } catch (e) {}
+  },
+  voiceList() {
+    const all = this.voices.length ? this.voices : this.FALLBACK_VOICES;
+    const ok = all.filter(v => !this._badVoices.has(v.name));
+    return ok.length ? ok : all;
+  },
+  goodVoice(exclude) {
+    return this.voiceList().find(v => v.name !== exclude) || this.voiceList()[0];
+  },
   async listVoices() {
     if (!this.key) throw new Error("Ingen API-nøgle");
     const r = await fetch("https://texttospeech.googleapis.com/v1/voices?languageCode=da-DK&key=" + encodeURIComponent(this.key));
@@ -1568,6 +1582,8 @@ const gtts = {
       .filter(v => (v.languageCodes || []).some(l => /^da-DK/i.test(l)))
       .map(v => ({ name: v.name, gender: v.ssmlGender || "" }))
       .sort((a, b) => a.name.localeCompare(b.name));
+    this._badVoices.clear();
+    try { localStorage.setItem("suffloer.gvoices", JSON.stringify(this.voices)); } catch (e) {}
     return this.voices;
   },
   async synth(text, voiceName, rate, pitch) {
@@ -1585,8 +1601,11 @@ const gtts = {
     });
     if (!r.ok) {
       const t = await r.text().catch(() => "");
-      const err = new Error("Google TTS " + r.status + " " + t.slice(0, 160));
+      const err = new Error("Google TTS " + r.status + " " + t.slice(0, 200));
       err.status = r.status;
+      // a rejected voice name is a per-request problem, not a broken key
+      err.badVoice = r.status === 400 && /voice|does not exist|not found|INVALID_ARGUMENT/i.test(t) &&
+        !/API_KEY|PERMISSION|referer|referrer/i.test(t);
       throw err;
     }
     const j = await r.json();
@@ -1655,13 +1674,21 @@ const speech = {
       await a.play();
     } catch (e) {
       const m = this._lastGError = (e && e.message) || "ukendt fejl";
-      const hardFail = (e && (e.status === 400 || e.status === 401 || e.status === 403)) ||
-        /API_KEY|PERMISSION_DENIED|referer|referrer|blocked|not authorized|forbidden/i.test(m);
-      if (hardFail) {
-        this._gBlocked = true;
+      if (e && e.badVoice && opt.gvoice) {
+        // one bad voice name — retry once with a working voice; don't touch the rest
+        gtts._badVoices.add(opt.gvoice);
+        if (!this._warned) { this._warned = true; toast("Stemmen findes ikke — skifter til en anden"); }
+        const sub = gtts.goodVoice(opt.gvoice);
+        if (sub && sub.name !== opt.gvoice && !opt._subbed && token === this._token) {
+          this._sayGoogle(text, { ...opt, gvoice: sub.name, _subbed: true }, onend);
+          return;
+        }
+      } else if ((e && (e.status === 401 || e.status === 403)) ||
+                 /API_KEY|PERMISSION_DENIED|referer|referrer|blocked|not authorized|forbidden/i.test(m)) {
+        this._gBlocked = true;   // broken key / restriction — stop hammering Google this session
         if (!this._warned) { this._warned = true; toast("AI-stemme afvist — tjek nøglen (⚙ AI-stemmer)"); }
       } else {
-        this._gBackoff = Math.min((this._gBackoff || 5000) * 2, 60000);
+        this._gBackoff = Math.min((this._gBackoff || 4000) * 2, 45000);
         this._gBackoffUntil = Date.now() + this._gBackoff;
         if (!this._warned) { this._warned = true; toast("AI-stemme hakker — bruger telefonen et øjeblik"); }
       }
@@ -1716,6 +1743,9 @@ const TIMBRES = [
 ];
 function autoAssignVoices(script, names, opts = {}) {
   script.voiceMap = script.voiceMap || {};
+  // include every character that actually has lines, even if the roles list is stale
+  const fromLines = [...new Set((script.lines || []).filter(l => l.character).map(l => l.character))];
+  names = [...new Set([...(names || []), ...fromLines])];
   const pool = speech.pool();
   const enoughVoices = pool.length >= names.length && pool.length > 1;
 
@@ -2870,7 +2900,15 @@ VIEWS.rehearse = (p) => {
   }
 
   function voiceFor(l) {
-    const vm = (l.role === "you" ? s.voiceMap[mine] : s.voiceMap[l.character]) || {};
+    const who = l.role === "you" ? mine : l.character;
+    let vm = s.voiceMap[who];
+    if (!vm) { vm = s.voiceMap[who] = {}; }
+    // every speaking role needs a Google voice when AI is on (covers late-found characters)
+    if (gtts.enabled() && (!vm.gvoice || gtts._badVoices.has(vm.gvoice))) {
+      const taken = new Set(Object.values(s.voiceMap).map(x => x && x.gvoice).filter(Boolean).filter(n => !gtts._badVoices.has(n)));
+      const pick = gtts.voiceList().find(v => !taken.has(v.name)) || gtts.goodVoice(vm.gvoice);
+      if (pick) { vm.gvoice = pick.name; store.save(); }
+    }
     return {
       voiceURI: vm.voiceURI,
       gvoice: vm.gvoice,
@@ -3189,6 +3227,11 @@ function addScriptFromParse(parsed, title) {
    10. boot
    --------------------------------------------------------------- */
 store.load();
+gtts.loadCachedVoices();
+// Make sure we have the real voice list before assigning voices from a fresh launch
+if (gtts.enabled() && !gtts.voices.length) {
+  gtts.listVoices().catch(() => {});
+}
 render();
 function killRecog() { if (_activeRecog) { try { _activeRecog.onend = null; _activeRecog.abort(); } catch (e) {} _activeRecog = null; } }
 window.addEventListener("pagehide", () => { speech.stop(); killRecog(); });
