@@ -1,5 +1,7 @@
 const fs = require("fs");
-const DIR = __dirname;
+const path = require("path");
+const DIR = __dirname;                 // build/
+const ROOT = path.join(DIR, "..");     // repo root (served by GitHub Pages)
 
 let html = fs.readFileSync(DIR + "/suffloer.src.html", "utf8");
 
@@ -98,7 +100,7 @@ if (ai < 0) { console.error("app anchor not found"); process.exit(1); }
 html = html.slice(0, ai) + inject + html.slice(ai);
 
 fs.writeFileSync(DIR + "/suffloer.html", html);
-console.log("built suffloer.html", (html.length / 1024).toFixed(0) + "KB");
+console.log("built build/suffloer.html", (html.length / 1024).toFixed(0) + "KB  (artifact fragment)");
 
 /* 3. Standalone document for self-hosting (GitHub Pages etc.) */
 const bodyHtml = html.replace(/^<title>[^<]*<\/title>\s*/, "");
@@ -119,5 +121,5 @@ ${bodyHtml}
 </body>
 </html>
 `;
-fs.writeFileSync(DIR + "/index.html", standalone);
-console.log("built index.html    ", (standalone.length / 1024).toFixed(0) + "KB  (self-hosting)");
+fs.writeFileSync(ROOT + "/index.html", standalone);
+console.log("built index.html         ", (standalone.length / 1024).toFixed(0) + "KB  (repo root — GitHub Pages)");
