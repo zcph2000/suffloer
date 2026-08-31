@@ -1266,6 +1266,13 @@ const gtts = {
   ],
   voices: [],
   _badVoices: new Set(),
+  _caps: {},   // voiceName -> { pitch, rate } — learned from Google's 400s
+  loadCaps() { try { this._caps = JSON.parse(localStorage.getItem("suffloer.gcaps") || "{}") || {}; } catch (e) { this._caps = {}; } },
+  saveCaps() { try { localStorage.setItem("suffloer.gcaps", JSON.stringify(this._caps)); } catch (e) {} },
+  capsFor(name) {
+    if (!this._caps[name]) this._caps[name] = { pitch: /-(Standard|Wavenet)-/i.test(name), rate: true };
+    return this._caps[name];
+  },
   get key() { try { return localStorage.getItem("suffloer.gkey") || ""; } catch (e) { return ""; } },
   set key(v) { try { v ? localStorage.setItem("suffloer.gkey", v) : localStorage.removeItem("suffloer.gkey"); } catch (e) {} },
   get on() { try { return localStorage.getItem("suffloer.gon") === "1"; } catch (e) { return false; } },
@@ -1298,26 +1305,38 @@ const gtts = {
     try { localStorage.setItem("suffloer.gvoices", JSON.stringify(this.voices)); } catch (e) {}
     return this.voices;
   },
-  async synth(text, voiceName, rate, pitch) {
-    const body = {
-      input: { text },
-      voice: { languageCode: "da-DK", name: voiceName || "da-DK-Wavenet-A" },
-      audioConfig: {
-        audioEncoding: "MP3",
-        speakingRate: clamp(rate || 1, 0.25, 4),
-        pitch: clamp(((pitch || 1) - 1) * 10, -20, 20),
-      },
-    };
-    const r = await fetch("https://texttospeech.googleapis.com/v1/text:synthesize?key=" + encodeURIComponent(this.key), {
+  async _post(body) {
+    return fetch("https://texttospeech.googleapis.com/v1/text:synthesize?key=" + encodeURIComponent(this.key), {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     });
+  },
+  async synth(text, voiceName, rate, pitch) {
+    const name = voiceName || "da-DK-Wavenet-A";
+    const caps = this.capsFor(name);
+    const build = () => {
+      const ac = { audioEncoding: "MP3" };
+      if (caps.rate && rate != null) ac.speakingRate = clamp(rate, 0.25, 4);
+      if (caps.pitch && pitch != null) ac.pitch = clamp((pitch - 1) * 10, -20, 20);
+      return { input: { text }, voice: { languageCode: "da-DK", name }, audioConfig: ac };
+    };
+    let r = await this._post(build());
+    let t = r.ok ? "" : await r.text().catch(() => "");
+    // Newer voices reject pitch (and sometimes speakingRate). Learn that and retry.
+    if (!r.ok && r.status === 400 && caps.pitch && /pitch/i.test(t)) {
+      caps.pitch = false; this.saveCaps();
+      r = await this._post(build()); t = r.ok ? "" : await r.text().catch(() => "");
+    }
+    if (!r.ok && r.status === 400 && caps.rate && /speaking.?rate/i.test(t)) {
+      caps.rate = false; this.saveCaps();
+      r = await this._post(build()); t = r.ok ? "" : await r.text().catch(() => "");
+    }
     if (!r.ok) {
-      const t = await r.text().catch(() => "");
       const err = new Error("Google TTS " + r.status + " " + t.slice(0, 200));
       err.status = r.status;
-      // a rejected voice name is a per-request problem, not a broken key
-      err.badVoice = r.status === 400 && /voice|does not exist|not found|INVALID_ARGUMENT/i.test(t) &&
-        !/API_KEY|PERMISSION|referer|referrer/i.test(t);
+      // a genuinely unknown voice name — but NOT a pitch/rate capability complaint
+      err.badVoice = (r.status === 400 || r.status === 404) &&
+        /(does not exist|not found|invalid voice|voice.*not.*support(?!.*pitch|.*rate)|no voice named)/i.test(t) &&
+        !/pitch|speaking.?rate|API_KEY|PERMISSION|referer|referrer/i.test(t);
       throw err;
     }
     const j = await r.json();
@@ -1356,12 +1375,13 @@ const speech = {
   _gBlocked: false,      // hard stop for the session (bad key / permission)
   _gBackoffUntil: 0,     // soft pause after a rate-limit / network hiccup
   _gBackoff: 0,
+  _gOkOnce: false,       // Google has succeeded at least once → key/setup is fine
   say(text, opt, onend) {
     if (!text) { onend && onend(); return; }
     this.stop();
     opt = opt || {};
-    const googleOk = gtts.enabled() && opt.gvoice && !this._gBlocked && Date.now() >= this._gBackoffUntil;
-    if (googleOk) { this._sayGoogle(text, opt, onend); return; }
+    const gate = opt.force || (!this._gBlocked && Date.now() >= this._gBackoffUntil);
+    if (gtts.enabled() && opt.gvoice && gate) { this._sayGoogle(text, opt, onend); return; }
     this._sayWeb(text, opt, onend);
   },
   cacheKey(text, opt) {
@@ -1373,7 +1393,7 @@ const speech = {
     try {
       let b64 = await audioCache.get(ck);
       if (!b64) { b64 = await gtts.synth(text, opt.gvoice, opt.rate, opt.pitch); audioCache.put(ck, b64); }
-      this._gBackoff = 0; this._gBackoffUntil = 0;         // recovered
+      this._gBackoff = 0; this._gBackoffUntil = 0; this._gOkOnce = true;   // recovered
       if (token !== this._token) return;                 // superseded by a newer say/stop
       const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
       const url = URL.createObjectURL(new Blob([bytes], { type: "audio/mpeg" }));
@@ -1395,9 +1415,10 @@ const speech = {
           this._sayGoogle(text, { ...opt, gvoice: sub.name, _subbed: true }, onend);
           return;
         }
-      } else if ((e && (e.status === 401 || e.status === 403)) ||
-                 /API_KEY|PERMISSION_DENIED|referer|referrer|blocked|not authorized|forbidden/i.test(m)) {
-        this._gBlocked = true;   // broken key / restriction — stop hammering Google this session
+      } else if (!this._gOkOnce && ((e && (e.status === 401 || e.status === 403)) ||
+                 /API_KEY|PERMISSION_DENIED|referer|referrer|not authorized|forbidden/i.test(m))) {
+        // never worked this session + auth-looking error → the key/setup is the problem
+        this._gBlocked = true;
         if (!this._warned) { this._warned = true; toast("AI-stemme afvist — tjek nøglen (⚙ AI-stemmer)"); }
       } else {
         this._gBackoff = Math.min((this._gBackoff || 4000) * 2, 45000);
@@ -1461,8 +1482,11 @@ function autoAssignVoices(script, names, opts = {}) {
   const pool = speech.pool();
   const enoughVoices = pool.length >= names.length && pool.length > 1;
 
-  // Google voices — one distinct voice per role, gender-alternated where possible
-  const gv = gtts.voiceList().slice();
+  // Google voices — prefer the dependable families (Wavenet/Standard: full pitch+rate
+  // control, always available), fall back to the rest only if we run short.
+  const gvAll = gtts.voiceList().slice();
+  const rank = v => /-Wavenet-/i.test(v.name) ? 0 : /-Standard-/i.test(v.name) ? 1 : /-Neural2-/i.test(v.name) ? 2 : 3;
+  const gv = gvAll.slice().sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
   const gMale = gv.filter(v => v.gender === "MALE");
   const gFem = gv.filter(v => v.gender && v.gender !== "MALE");
   const gOrder = (gMale.length && gFem.length)
@@ -2119,6 +2143,9 @@ VIEWS.voices = ({ id }) => {
   const s = store.script(id);
   if (!s) { go("library", {}, { push: false }); return; }
   topTitle.textContent = "Stemmer";
+  // fresh slate — you're here to test voices
+  speech._gBlocked = false; speech._gBackoff = 0; speech._gBackoffUntil = 0; speech._warned = false;
+  gtts._badVoices.clear();
   main.appendChild(el("h2", { class: "screen-title", text: "Stemmer" }));
 
   const ai = gtts.enabled();
@@ -2172,25 +2199,36 @@ VIEWS.voices = ({ id }) => {
       sel.value = vm.voiceURI || "";
       sel.addEventListener("change", () => { vm.voiceURI = sel.value; store.save(); });
     }
+    const playBtn = el("button", {
+      class: "icon-btn", "aria-label": "Afspil", text: "▶",
+      onclick: () => {
+        speech._lastGError = "";
+        speech.say(`Hej, jeg er ${c.name}.`, { force: true, voiceURI: vm.voiceURI, gvoice: vm.gvoice, rate: vm.rate, pitch: vm.pitch });
+        if (ai) setTimeout(() => { if (speech._lastGError) toast("Kunne ikke: " + speech._lastGError.replace(/^Google TTS \d+\s*/, "").slice(0, 90)); }, 2500);
+      },
+    });
     list.appendChild(el("div", { class: "voice-item" }, [
       el("div", { class: "voice-item__name", text: c.name }),
       sel,
-      el("button", {
-        class: "icon-btn", "aria-label": "Afspil", text: "▶",
-        onclick: () => speech.say(`Hej, jeg er ${c.name}.`, { voiceURI: vm.voiceURI, gvoice: vm.gvoice, rate: vm.rate, pitch: vm.pitch }),
-      }),
+      playBtn,
     ]));
 
-    list.appendChild(el("div", { class: "slider-row", style: "margin:2px 0 6px" }, [
-      el("span", { style: "font-size:.7rem;letter-spacing:.08em;color:var(--ink-faint);width:27%", text: "TONE" }),
-      (() => {
-        const r = el("input", { type: "range", min: "0.6", max: "1.6", step: "0.02", value: String(vm.pitch ?? 1) });
-        const o = el("output", { text: (+(vm.pitch ?? 1)).toFixed(2) });
-        r.addEventListener("input", () => { vm.pitch = +r.value; o.textContent = (+r.value).toFixed(2); });
-        r.addEventListener("change", () => store.save());
-        return el("div", { class: "slider-row", style: "flex:1" }, [r, o]);
-      })(),
-    ]));
+    const pitchOk = !ai || gtts.capsFor(vm.gvoice || "").pitch;
+    if (pitchOk) {
+      list.appendChild(el("div", { class: "slider-row", style: "margin:2px 0 6px" }, [
+        el("span", { style: "font-size:.7rem;letter-spacing:.08em;color:var(--ink-faint);width:27%", text: "TONE" }),
+        (() => {
+          const r = el("input", { type: "range", min: "0.6", max: "1.6", step: "0.02", value: String(vm.pitch ?? 1) });
+          const o = el("output", { text: (+(vm.pitch ?? 1)).toFixed(2) });
+          r.addEventListener("input", () => { vm.pitch = +r.value; o.textContent = (+r.value).toFixed(2); });
+          r.addEventListener("change", () => store.save());
+          return el("div", { class: "slider-row", style: "flex:1" }, [r, o]);
+        })(),
+      ]));
+    } else {
+      list.appendChild(el("div", { style: "font-size:.72rem;color:var(--ink-faint);margin:2px 0 6px" },
+        ["Denne stemme har fast toneleje."]));
+    }
   });
   main.appendChild(list);
   main.appendChild(el("button", { class: "btn btn--ghost", style: "margin-top:16px", onclick: () => back() }, ["Færdig"]));
@@ -2940,6 +2978,7 @@ function addScriptFromParse(parsed, title) {
    --------------------------------------------------------------- */
 store.load();
 gtts.loadCachedVoices();
+gtts.loadCaps();
 // Make sure we have the real voice list before assigning voices from a fresh launch
 if (gtts.enabled() && !gtts.voices.length) {
   gtts.listVoices().catch(() => {});
