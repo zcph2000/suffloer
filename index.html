@@ -1295,7 +1295,12 @@ const gtts = {
     const r = await fetch("https://texttospeech.googleapis.com/v1/text:synthesize?key=" + encodeURIComponent(this.key), {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     });
-    if (!r.ok) { const t = await r.text().catch(() => ""); throw new Error("Google TTS " + r.status + " " + t.slice(0, 160)); }
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
+      const err = new Error("Google TTS " + r.status + " " + t.slice(0, 160));
+      err.status = r.status;
+      throw err;
+    }
     const j = await r.json();
     if (!j.audioContent) throw new Error("Tomt svar fra Google");
     return j.audioContent; // base64 mp3
@@ -1329,12 +1334,15 @@ const speech = {
     if (this.supported) { try { speechSynthesis.cancel(); } catch (e) {} }
     clearInterval(this._keepAlive); this._keepAlive = null;
   },
-  _gFails: 0,
+  _gBlocked: false,      // hard stop for the session (bad key / permission)
+  _gBackoffUntil: 0,     // soft pause after a rate-limit / network hiccup
+  _gBackoff: 0,
   say(text, opt, onend) {
     if (!text) { onend && onend(); return; }
     this.stop();
     opt = opt || {};
-    if (gtts.enabled() && opt.gvoice && this._gFails < 3) { this._sayGoogle(text, opt, onend); return; }
+    const googleOk = gtts.enabled() && opt.gvoice && !this._gBlocked && Date.now() >= this._gBackoffUntil;
+    if (googleOk) { this._sayGoogle(text, opt, onend); return; }
     this._sayWeb(text, opt, onend);
   },
   cacheKey(text, opt) {
@@ -1346,7 +1354,7 @@ const speech = {
     try {
       let b64 = await audioCache.get(ck);
       if (!b64) { b64 = await gtts.synth(text, opt.gvoice, opt.rate, opt.pitch); audioCache.put(ck, b64); }
-      this._gFails = 0;
+      this._gBackoff = 0; this._gBackoffUntil = 0;         // recovered
       if (token !== this._token) return;                 // superseded by a newer say/stop
       const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
       const url = URL.createObjectURL(new Blob([bytes], { type: "audio/mpeg" }));
@@ -1358,10 +1366,19 @@ const speech = {
       a.onended = fin; a.onerror = fin;
       await a.play();
     } catch (e) {
-      this._gFails++;
+      const m = this._lastGError = (e && e.message) || "ukendt fejl";
+      const hardFail = (e && (e.status === 400 || e.status === 401 || e.status === 403)) ||
+        /API_KEY|PERMISSION_DENIED|referer|referrer|blocked|not authorized|forbidden/i.test(m);
+      if (hardFail) {
+        this._gBlocked = true;
+        if (!this._warned) { this._warned = true; toast("AI-stemme afvist — tjek nøglen (⚙ AI-stemmer)"); }
+      } else {
+        this._gBackoff = Math.min((this._gBackoff || 5000) * 2, 60000);
+        this._gBackoffUntil = Date.now() + this._gBackoff;
+        if (!this._warned) { this._warned = true; toast("AI-stemme hakker — bruger telefonen et øjeblik"); }
+      }
+      console.warn("Google TTS:", m);
       if (token !== this._token) return;
-      if (!this._warned) { this._warned = true; toast("AI-stemme svarer ikke — bruger telefonens stemme"); }
-      console.warn("Google TTS:", e && e.message);
       this._sayWeb(text, opt, onend);
     }
   },
@@ -1409,17 +1426,22 @@ const TIMBRES = [
   { pitch: 1.30, rate: 1.00 },
   { pitch: 0.85, rate: 1.03 },
 ];
-function autoAssignVoices(script, names) {
+function autoAssignVoices(script, names, opts = {}) {
   script.voiceMap = script.voiceMap || {};
   const pool = speech.pool();
   const enoughVoices = pool.length >= names.length && pool.length > 1;
-  // Google voices: alternate genders so neighbouring roles sound different
+
+  // Google voices — one distinct voice per role, gender-alternated where possible
   const gv = gtts.voiceList().slice();
   const gMale = gv.filter(v => v.gender === "MALE");
-  const gFem = gv.filter(v => v.gender !== "MALE");
-  let i = 0;
-  names.forEach(name => {
+  const gFem = gv.filter(v => v.gender && v.gender !== "MALE");
+  const gOrder = (gMale.length && gFem.length)
+    ? gFem.flatMap((v, k) => [v, gMale[k % gMale.length]])   // f, m, f, m …
+    : gv;
+
+  names.forEach((name, i) => {
     const cur = script.voiceMap[name] || {};
+    if (opts.regen) delete cur.gvoice;
     if (!cur.voiceURI && !cur.gvoice) {
       if (enoughVoices) { cur.voiceURI = pool[i % pool.length].voiceURI; cur.rate = 1; cur.pitch = 1; }
       else {
@@ -1428,13 +1450,23 @@ function autoAssignVoices(script, names) {
         cur.rate = t.rate; cur.pitch = t.pitch;
       }
     }
-    if (!cur.gvoice && gv.length) {
-      const src = (i % 2 === 0 ? gFem : gMale).length ? (i % 2 === 0 ? gFem : gMale) : gv;
-      cur.gvoice = src[Math.floor(i / 2) % src.length].name;
-    }
     script.voiceMap[name] = cur;
-    i++;
   });
+
+  // Fill in missing gvoices, avoiding collisions with ones already picked
+  if (gv.length) {
+    const taken = new Set(names.map(n => script.voiceMap[n].gvoice).filter(Boolean));
+    let g = 0;
+    names.forEach(name => {
+      const cur = script.voiceMap[name];
+      if (cur.gvoice) return;
+      let guard = 0;
+      while (taken.has(gOrder[g % gOrder.length].name) && taken.size < gOrder.length && guard++ < gOrder.length) g++;
+      cur.gvoice = gOrder[g % gOrder.length].name;
+      taken.add(cur.gvoice);
+      g++;
+    });
+  }
 }
 
 /* ---------------------------------------------------------------
@@ -2076,11 +2108,20 @@ VIEWS.voices = ({ id }) => {
     ]));
   }
 
-  main.appendChild(el("button", {
-    class: "btn btn--subtle", style: "margin-bottom:14px", onclick: () => go("aistemmer"),
-  }, [ai ? "⚙  AI-stemmer / nøgle" : "✨  Slå AI-stemmer til"]));
+  const names0 = s.characters.map(c => c.name);
+  const row = el("div", { class: "btn-row", style: "margin-bottom:14px" }, [
+    el("button", { class: "btn btn--subtle", onclick: () => go("aistemmer") },
+      [ai ? "⚙  AI-stemmer / nøgle" : "✨  Slå AI-stemmer til"]),
+  ]);
+  if (ai) {
+    row.appendChild(el("button", {
+      class: "btn btn--subtle",
+      onclick: () => { autoAssignVoices(s, names0, { regen: true }); store.save(); render(); toast("Stemmer fordelt igen"); },
+    }, ["🔀  Fordel igen"]));
+  }
+  main.appendChild(row);
 
-  autoAssignVoices(s, s.characters.map(c => c.name));
+  autoAssignVoices(s, names0);
   store.save();
 
   const gvoices = gtts.voiceList();
@@ -2128,7 +2169,7 @@ VIEWS.voices = ({ id }) => {
 /* ---------- AI voices setup (Google Cloud TTS) ---------- */
 VIEWS.aistemmer = () => {
   topTitle.textContent = "AI-stemmer";
-  speech._gFails = 0; speech._warned = false;   // give Google another chance after edits
+  speech._gBlocked = false; speech._gBackoff = 0; speech._gBackoffUntil = 0; speech._warned = false;
   main.appendChild(el("h2", { class: "screen-title", text: "AI-stemmer" }));
   main.appendChild(el("p", { class: "lede" }, [
     "Med en gratis Google-nøgle får appen rigtige danske stemmer. Du skal kun sætte det op én gang.",
@@ -2179,7 +2220,7 @@ VIEWS.aistemmer = () => {
       status.textContent = "Tjekker …";
       try {
         const vs = await gtts.listVoices();
-        status.textContent = `Virker! ${vs.length} danske stemmer fundet.`;
+        status.textContent = `Virker! ${vs.length} danske stemmer: ` + vs.slice(0, 4).map(v => v.name.replace("da-DK-", "")).join(", ") + (vs.length > 4 ? " …" : "");
         status.style.color = "var(--good)";
       } catch (e) {
         status.textContent = e.message || "Kunne ikke nå Google.";
@@ -2188,6 +2229,11 @@ VIEWS.aistemmer = () => {
     },
   }, ["Test nøglen"]));
   main.appendChild(status);
+
+  if (speech._lastGError) {
+    main.appendChild(el("p", { class: "muted-note", style: "margin-top:8px;color:var(--you-ink)" },
+      ["Sidste fejl under øvning: " + speech._lastGError.slice(0, 180)]));
+  }
 
   const onToggle = el("label", { class: "toggle-row", style: "margin-top:16px" }, [
     el("div", { class: "toggle-row__text" }, [
@@ -2770,20 +2816,23 @@ VIEWS.rehearse = (p) => {
 
   setTimeout(() => { if (lineEls[0]) lineEls[0].scrollIntoView({ block: "center" }); }, 60);
 
-  // With AI voices on, quietly pre-synthesise the scene so playback doesn't stall.
+  // With AI voices on, gently pre-synthesise ahead of the cursor so playback
+  // doesn't stall — slow enough not to trip Google's per-minute rate limit.
   if (gtts.enabled()) {
     const myToken = ++prefetchToken;
     (async () => {
+      await new Promise(r => setTimeout(r, 1500));
+      let miss = 0;
       for (const l of seq) {
-        if (myToken !== prefetchToken) return;
+        if (myToken !== prefetchToken || speech._gBlocked) return;
         if (l.kind !== "dialogue") continue;
         const vf = voiceFor(l);
         if (!vf.gvoice) continue;
         const ck = speech.cacheKey(l.text, vf);
         if (await audioCache.get(ck)) continue;
-        try { audioCache.put(ck, await gtts.synth(l.text, vf.gvoice, vf.rate, vf.pitch)); }
-        catch (e) { return; }   // bad key / quota — stop; live playback will show the error
-        await new Promise(r => setTimeout(r, 150));
+        try { audioCache.put(ck, await gtts.synth(l.text, vf.gvoice, vf.rate, vf.pitch)); miss = 0; }
+        catch (e) { if (++miss >= 2) return; await new Promise(r => setTimeout(r, 4000)); continue; }
+        await new Promise(r => setTimeout(r, 700));
       }
     })();
   }
