@@ -1978,11 +1978,11 @@ VIEWS.library = () => {
     class: "btn btn--primary", onclick: () => go("import"),
   }, ["＋  Hent manus ind"]));
 
-  const aiBtn = el("button", {
-    class: "btn btn--subtle", style: "margin-top:10px",
-    onclick: () => go("aistemmer"),
-  }, [gtts.enabled() ? "✨  AI-stemmer: til" : "✨  AI-stemmer"]);
-  main.appendChild(aiBtn);
+  main.appendChild(el("div", { class: "btn-row", style: "margin-top:10px" }, [
+    el("button", { class: "btn btn--subtle", onclick: () => go("aistemmer") },
+      [gtts.enabled() ? "✨  AI-stemmer: til" : "✨  AI-stemmer"]),
+    el("button", { class: "btn btn--subtle", onclick: pickImportFile }, ["⬇  Importér fra fil"]),
+  ]));
 
   if (!scripts.length) {
     const e = el("div", { class: "empty" }, [
@@ -2014,8 +2014,13 @@ VIEWS.library = () => {
   });
   main.appendChild(list);
 
-  main.appendChild(el("p", { class: "muted-note", style: "margin-top:24px" },
-    ["Alt gemmes kun på denne enhed i denne browser. Læg siden på hjemmeskærmen (Del → Føj til hjemmeskærm) for at bruge den som en app."]));
+  main.appendChild(el("button", {
+    class: "btn btn--subtle", style: "margin-top:16px",
+    onclick: exportAll,
+  }, ["⬆  Sikkerhedskopi af alt (fil)"]));
+
+  main.appendChild(el("p", { class: "muted-note", style: "margin-top:16px" },
+    ["Alt gemmes kun på denne enhed i denne browser. Vil du flytte et manus til en anden enhed: åbn manuset og tryk “⬆ Del manus (fil)”, send filen, og brug “⬇ Importér fra fil” her. Læg siden på hjemmeskærmen (Del → Føj til hjemmeskærm) for at bruge den som en app."]));
 };
 
 /* ---------- Import ---------- */
@@ -2590,16 +2595,17 @@ VIEWS.script = ({ id }) => {
   })));
 
   main.appendChild(el("hr", { class: "divider" }));
+  main.appendChild(el("div", { class: "btn-row" }, [
+    el("button", { class: "btn btn--ghost", onclick: () => go("voices", { id }) }, ["🔊  Stemmer"]),
+    el("button", { class: "btn btn--ghost", onclick: () => exportScript(id) }, ["⬆  Del manus (fil)"]),
+  ]));
   let armed = false;
-  const delBtn = el("button", { class: "btn btn--subtle", onclick: () => {
+  const delBtn = el("button", { class: "btn btn--subtle", style: "margin-top:10px", onclick: () => {
     if (!armed) { armed = true; delBtn.textContent = "Tryk igen for at slette"; delBtn.classList.add("btn--you"); return; }
     store.removeScript(id);
     go("library", {}, { push: false });
   } }, ["Slet manus"]);
-  main.appendChild(el("div", { class: "btn-row" }, [
-    el("button", { class: "btn btn--ghost", onclick: () => go("voices", { id }) }, ["🔊  Stemmer"]),
-    delBtn,
-  ]));
+  main.appendChild(delBtn);
 };
 
 /* ---------- Work mode: read, annotate, edit ---------- */
@@ -3604,6 +3610,110 @@ function addScriptFromParse(parsed, title) {
   store.data.scripts.push(script);
   store.save();
   go("script", { id: script.id });
+}
+
+/* ---- export / import a manuscript as a file (move between devices, backup) ---- */
+function scriptFileName(name) {
+  return ((name || "manus").replace(/[^\p{L}\p{N} _-]+/gu, "").trim().replace(/\s+/g, "_").slice(0, 60) || "manus") + ".suffloer.json";
+}
+function bundle(scripts) {
+  return { app: "suffloer", version: 1, exported: new Date().toISOString(), scripts: JSON.parse(JSON.stringify(scripts)) };
+}
+function downloadJSON(obj, filename) {
+  const json = JSON.stringify(obj, null, 2);
+  try {
+    const url = URL.createObjectURL(new Blob([json], { type: "application/json" }));
+    const a = document.createElement("a");
+    a.href = url; a.download = filename; a.style.display = "none";
+    document.body.appendChild(a); a.click();
+    setTimeout(() => { a.remove(); URL.revokeObjectURL(url); }, 1500);
+    return true;
+  } catch (e) { return false; }
+}
+function showCopyFallback(text) {
+  const ta = el("textarea", { class: "paste", style: "min-height:200px" });
+  ta.value = text;
+  openSheet("Kopiér manus", el("div", {}, [
+    el("p", { class: "sub", text: "Download blev blokeret her. Kopiér teksten og gem den som en note eller fil, du kan åbne på den anden enhed." }),
+    ta,
+    el("button", {
+      class: "btn btn--primary", style: "margin-top:10px",
+      onclick: () => { ta.select(); (navigator.clipboard ? navigator.clipboard.writeText(ta.value) : Promise.reject()).then(() => toast("Kopieret")).catch(() => toast("Markér og kopiér selv")); },
+    }, ["Kopiér"]),
+  ]));
+  setTimeout(() => { ta.focus(); ta.select(); }, 60);
+}
+function exportScript(id) {
+  const s = store.script(id);
+  if (!s) return;
+  const b = bundle([s]);
+  if (!downloadJSON(b, scriptFileName(s.title))) showCopyFallback(JSON.stringify(b, null, 2));
+  else toast("Fil hentet — send den til din anden enhed");
+}
+function exportAll() {
+  if (!store.data.scripts.length) { toast("Ingen manus at kopiere"); return; }
+  const b = bundle(store.data.scripts);
+  if (!downloadJSON(b, "suffloer-backup-" + new Date().toISOString().slice(0, 10) + ".json")) showCopyFallback(JSON.stringify(b, null, 2));
+  else toast("Sikkerhedskopi hentet");
+}
+function normImported(s) {
+  if (!s || !Array.isArray(s.lines) || !Array.isArray(s.scenes)) throw new Error("Filen ser beskadiget ud.");
+  return {
+    id: s.id || uid(),
+    title: String(s.title || "Importeret manus"),
+    createdAt: s.createdAt || Date.now(),
+    lines: s.lines,
+    scenes: s.scenes,
+    characters: Array.isArray(s.characters) && s.characters.length ? s.characters : deriveCharacters(s.lines),
+    myCharacter: s.myCharacter || null,
+    voiceMap: s.voiceMap && typeof s.voiceMap === "object" ? s.voiceMap : {},
+    notes: Array.isArray(s.notes) ? s.notes : [],
+  };
+}
+async function importFromFile(file) {
+  let scripts, text;
+  try { text = await file.text(); } catch (e) { showError("Kunne ikke læse filen.", "Kunne ikke importere"); return; }
+  let data;
+  try { data = JSON.parse(text); }
+  catch (e) { showError("Det er ikke en Sufflør-fil (kunne ikke læse indholdet).", "Kunne ikke importere"); return; }
+  try {
+    const raw = Array.isArray(data) ? data
+      : Array.isArray(data.scripts) ? data.scripts
+        : (data.lines && data.scenes) ? [data] : null;
+    if (!raw || !raw.length) throw new Error("Der er ingen manus i filen.");
+    scripts = raw.map(normImported);
+  } catch (e) {
+    showError(e.message || "Filen ser ikke rigtig ud.", "Kunne ikke importere");
+    return;
+  }
+  openSheet("Importér", el("div", { class: "stack" }, [
+    el("p", { class: "sub", style: "white-space:pre-wrap", text: scripts.map(s => `• ${s.title} — ${s.scenes.length} scene${s.scenes.length === 1 ? "" : "r"}, ${(s.notes || []).length} note${(s.notes || []).length === 1 ? "" : "r"}`).join("\n") }),
+    el("button", { class: "btn btn--primary", onclick: () => doImport(scripts, "merge") }, ["Opdatér / tilføj"]),
+    el("button", { class: "btn btn--ghost", onclick: () => doImport(scripts, "copy") }, ["Tilføj som ny kopi"]),
+  ]));
+}
+function doImport(scripts, mode) {
+  let added = 0, updated = 0;
+  scripts.forEach(s => {
+    const at = store.data.scripts.findIndex(x => x.id === s.id);
+    if (mode === "merge" && at >= 0) { store.data.scripts[at] = s; updated++; }
+    else {
+      if (at >= 0) { s.id = uid(); s.title += " (kopi)"; }
+      store.data.scripts.push(s); added++;
+    }
+  });
+  store.save();
+  closeSheet();
+  backStack = [];
+  go("library", {}, { push: false });
+  toast([updated && updated + " opdateret", added && added + " tilføjet"].filter(Boolean).join(" · ") || "Importeret");
+}
+function pickImportFile() {
+  const inp = el("input", { type: "file", accept: ".json,application/json", style: "display:none" });
+  inp.addEventListener("change", () => { if (inp.files[0]) importFromFile(inp.files[0]); });
+  document.body.appendChild(inp);
+  inp.click();
+  setTimeout(() => inp.remove(), 60000);
 }
 
 /* ---------------------------------------------------------------
