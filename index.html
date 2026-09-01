@@ -1567,13 +1567,151 @@ const speech = {
 };
 speech.init();
 
-// Optional hands-free: Web Speech recognition (Safari/iOS exposes webkitSpeechRecognition)
-const SR = window.SpeechRecognition || window.webkitSpeechRecognition || null;
 const normWords = t => (t || "")
   .toLowerCase()
   .replace(/[^\p{L}\s]/gu, " ")
   .split(/\s+/)
   .filter(Boolean);
+
+/* ---------------------------------------------------------------
+   Hands-free: microphone + voice-activity detection (works offline),
+   with optional Google Speech-to-Text for "hjælp" / "videre" commands.
+   --------------------------------------------------------------- */
+const HANDSFREE_SUPPORTED = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia &&
+  (window.AudioContext || window.webkitAudioContext));
+
+const mic = {
+  stream: null, ctx: null, src: null, proc: null, mute: null,
+  sampleRate: 0,
+  _armed: false,
+  _onUtterance: null,
+  _preRoll: [],
+  _buf: [],
+  _speaking: false,
+  _speechMs: 0,
+  _silenceMs: 0,
+  _noise: 0.006,
+  async open() {
+    if (this.stream) return true;
+    try {
+      this.stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+    } catch (e) { return false; }
+    const AC = window.AudioContext || window.webkitAudioContext;
+    try {
+      this.ctx = new AC();
+      try { await this.ctx.resume(); } catch (e) {}
+      this.sampleRate = this.ctx.sampleRate || 44100;
+      this.src = this.ctx.createMediaStreamSource(this.stream);
+      this.proc = this.ctx.createScriptProcessor(4096, 1, 1);
+      this.mute = this.ctx.createGain();
+      this.mute.gain.value = 0;
+      this.proc.onaudioprocess = e => this._frame(e.inputBuffer.getChannelData(0));
+      this.src.connect(this.proc);
+      this.proc.connect(this.mute);
+      this.mute.connect(this.ctx.destination);
+      return true;
+    } catch (e) { this.close(); return false; }
+  },
+  close() {
+    try { if (this.proc) { this.proc.onaudioprocess = null; this.proc.disconnect(); } } catch (e) {}
+    try { this.src && this.src.disconnect(); } catch (e) {}
+    try { this.mute && this.mute.disconnect(); } catch (e) {}
+    try { this.ctx && this.ctx.close(); } catch (e) {}
+    try { this.stream && this.stream.getTracks().forEach(t => t.stop()); } catch (e) {}
+    this.stream = this.ctx = this.src = this.proc = this.mute = null;
+    this._armed = false; this._onUtterance = null; this._buf = []; this._speaking = false;
+  },
+  arm(onUtterance) {
+    this._onUtterance = onUtterance;
+    this._armed = true;
+    this._buf = []; this._speaking = false;
+    this._speechMs = 0; this._silenceMs = 0;
+  },
+  disarm() {
+    this._armed = false; this._onUtterance = null;
+    this._buf = []; this._speaking = false;
+  },
+  _rms(d) {
+    let s = 0, n = 0;
+    for (let i = 0; i < d.length; i += 4) { s += d[i] * d[i]; n++; }
+    return Math.sqrt(s / (n || 1));
+  },
+  _frame(data) {
+    this._preRoll.push(data.slice(0));
+    if (this._preRoll.length > 3) this._preRoll.shift();
+    if (!this._armed) return;
+    const ms = (data.length / (this.sampleRate || 44100)) * 1000;
+    const rms = this._rms(data);
+    const thresh = Math.max(0.011, this._noise * 3.2);
+    const loud = rms > thresh;
+    if (!loud) this._noise = this._noise * 0.985 + rms * 0.015;
+
+    if (this._speaking) {
+      this._buf.push(data.slice(0));
+      if (loud) this._silenceMs = 0;
+      else {
+        this._silenceMs += ms;
+        if (this._silenceMs > 650) return this._end();
+      }
+      if (this._buf.length * ms > 15000) this._end();
+    } else if (loud) {
+      this._speechMs += ms;
+      if (this._speechMs > 170) {
+        this._speaking = true; this._silenceMs = 0;
+        this._buf = this._preRoll.map(a => a.slice(0));
+      }
+    } else {
+      this._speechMs = Math.max(0, this._speechMs - ms);
+    }
+  },
+  _end() {
+    if (!this._speaking) return;
+    this._speaking = false; this._speechMs = 0; this._silenceMs = 0;
+    const chunks = this._buf; this._buf = [];
+    const cb = this._onUtterance;
+    if (!this._armed || !cb) return;
+    let len = 0; chunks.forEach(c => len += c.length);
+    if (len < (this.sampleRate || 44100) * 0.15) return;   // too short — ignore blip
+    const pcm = new Float32Array(len);
+    let o = 0; chunks.forEach(c => { pcm.set(c, o); o += c.length; });
+    cb(pcm, this.sampleRate);
+  },
+};
+
+function pcmToLinear16(pcm, srcRate, dstRate) {
+  dstRate = dstRate || 16000;
+  const ratio = (srcRate || 44100) / dstRate;
+  const outLen = Math.max(1, Math.floor(pcm.length / ratio));
+  const out = new Int16Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const v = pcm[Math.floor(i * ratio)] || 0;
+    out[i] = Math.max(-1, Math.min(1, v)) * 0x7fff;
+  }
+  return out;
+}
+function int16ToBase64(int16) {
+  const bytes = new Uint8Array(int16.buffer);
+  let bin = "";
+  const CH = 0x8000;
+  for (let i = 0; i < bytes.length; i += CH) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+  return btoa(bin);
+}
+async function googleSTT(pcmFloat32, srcRate) {
+  if (!gtts.key) throw new Error("Ingen nøgle");
+  const l16 = pcmToLinear16(pcmFloat32, srcRate, 16000);
+  const r = await fetch("https://speech.googleapis.com/v1/speech:recognize?key=" + encodeURIComponent(gtts.key), {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      config: { encoding: "LINEAR16", sampleRateHertz: 16000, languageCode: "da-DK", model: "latest_short", maxAlternatives: 1 },
+      audio: { content: int16ToBase64(l16) },
+    }),
+  });
+  if (!r.ok) { const t = await r.text().catch(() => ""); const e = new Error("STT " + r.status + " " + t.slice(0, 180)); e.status = r.status; throw e; }
+  const j = await r.json();
+  return (j.results || []).map(x => (x.alternatives && x.alternatives[0] && x.alternatives[0].transcript) || "").join(" ").trim();
+}
 
 // Give each character a distinct timbre. With only one Danish voice available
 // (the common iPhone case) we separate them by pitch + a little rate variation.
@@ -1703,13 +1841,22 @@ function back() {
 backBtn.addEventListener("click", back);
 
 let _lastView = null;
-let _activeRecog = null;
 let prefetchToken = 0;
+let _wakeLock = null;
+function requestWake() {
+  try {
+    if (navigator.wakeLock && !_wakeLock) {
+      navigator.wakeLock.request("screen").then(w => { _wakeLock = w; w.addEventListener("release", () => { _wakeLock = null; }); }, () => {});
+    }
+  } catch (e) {}
+}
+function releaseWake() { try { if (_wakeLock) { _wakeLock.release(); _wakeLock = null; } } catch (e) {} }
+document.addEventListener("visibilitychange", () => { if (!document.hidden && nav.name === "rehearse") requestWake(); });
 function render() {
   const scroller = document.scrollingElement || document.documentElement;
   const sameView = _lastView === nav.name;
   const keepY = sameView ? (window.scrollY || scroller.scrollTop || 0) : 0;
-  if (_activeRecog) { try { _activeRecog.onend = null; _activeRecog.abort(); } catch (e) {} _activeRecog = null; }
+  if (nav.name !== "rehearse") { mic.close(); releaseWake(); }
   prefetchToken++;
   // leaving work mode → flush edits and drop the live reference
   if (draft && draft._live && nav.name !== "work") { store.save(); draft = null; }
@@ -2661,8 +2808,9 @@ VIEWS.aistemmer = () => {
   const steps = [
     ["Åbn Google Cloud og log ind", "https://console.cloud.google.com/", "Med din almindelige Google-konto."],
     ["Aktivér Text-to-Speech", "https://console.cloud.google.com/apis/library/texttospeech.googleapis.com", "Klik “Enable”. Bliver du bedt om et betalingskort, så indtast det — du opkræves ikke inden for de gratis 1 mio. tegn/måned."],
+    ["Aktivér Speech-to-Text (til “hjælp/videre”)", "https://console.cloud.google.com/apis/library/speech.googleapis.com", "Klik “Enable”. Kun nødvendig hvis du vil styre håndfri-øvning med stemmen. Gratis 60 min/måned."],
     ["Lav en API-nøgle", "https://console.cloud.google.com/apis/credentials", "“Create credentials” → “API key”. Kopiér nøglen."],
-    ["(Anbefalet) Begræns nøglen", "https://console.cloud.google.com/apis/credentials", "Klik på nøglen → “Restrict key” → vælg “Cloud Text-to-Speech API”. Under “Website restrictions” tilføj din app-adresse."],
+    ["(Anbefalet) Begræns nøglen", "https://console.cloud.google.com/apis/credentials", "Klik på nøglen → “Restrict key” → vælg BÅDE “Cloud Text-to-Speech API” og “Cloud Speech-to-Text API”. Under “Website restrictions” tilføj din app-adresse."],
   ];
   const ol = el("div", { class: "stack" });
   steps.forEach(([t, url, sub], i) => {
@@ -2754,6 +2902,7 @@ VIEWS.setup = ({ id, scenes }) => {
     speakDirections: false,
     hint: store.data.settings.hint || "hide",   // hide | start | full
     listen: false,
+    stt: gtts.enabled(),
     showNotes: (s.notes || []).length > 0,
     others: new Set(),
   };
@@ -2877,23 +3026,37 @@ VIEWS.setup = ({ id, scenes }) => {
     })(),
   ]);
 
-  const srSupported = !!SR;
+  const hfOk = HANDSFREE_SUPPORTED;
+  const sttBox = el("div", { style: "display:none" });
   const listenToggle = el("label", { class: "toggle-row" }, [
     el("div", { class: "toggle-row__text" }, [
       el("b", { text: "Lyt efter mig (håndfri)" }),
-      el("span", { text: srSupported
-        ? "Appen hører efter og går selv videre, når du har sagt din replik. Kræver mikrofon-adgang og net."
-        : "Denne browser kan ikke lytte. Brug knappen “Næste replik”." }),
+      el("span", { text: hfOk
+        ? "Går selv videre når du har sagt din replik. Virker offline. Bed om mikrofon-adgang første gang."
+        : "Denne enhed kan ikke bruge mikrofonen her. Brug knappen “Næste replik”." }),
     ]),
     (() => {
       const c = el("input", { type: "checkbox", class: "switch" });
-      if (!srSupported) c.disabled = true;
-      c.addEventListener("change", () => st.listen = c.checked);
+      if (!hfOk) c.disabled = true;
+      c.addEventListener("change", () => { st.listen = c.checked; sttBox.style.display = (c.checked && gtts.enabled()) ? "" : "none"; });
       return c;
     })(),
   ]);
+  const sttToggle = el("label", { class: "toggle-row" }, [
+    el("div", { class: "toggle-row__text" }, [
+      el("b", { text: "Forstå “hjælp” og “videre”" }),
+      el("span", { text: "Sig “hjælp” for at få replikken læst, “videre” for at springe over. Bruger din Google-nøgle (lille net-forbrug)." }),
+    ]),
+    (() => {
+      const c = el("input", { type: "checkbox", class: "switch" });
+      c.checked = st.stt;
+      c.addEventListener("change", () => st.stt = c.checked);
+      return c;
+    })(),
+  ]);
+  sttBox.appendChild(sttToggle);
 
-  wrap.appendChild(el("div", { class: "stack", style: "margin-top:12px" }, [mineToggle, hintBox, notesToggle, listenToggle, dirToggle]));
+  wrap.appendChild(el("div", { class: "stack", style: "margin-top:12px" }, [mineToggle, hintBox, notesToggle, listenToggle, sttBox, dirToggle]));
 
   const startBtn = el("button", { class: "btn btn--primary", style: "margin-top:22px" }, ["▶  Start"]);
   startBtn.addEventListener("click", () => {
@@ -2907,7 +3070,8 @@ VIEWS.setup = ({ id, scenes }) => {
       readMine: st.mode === "listen" ? true : (st.mode === "read" ? false : st.readMine),
       speakDirections: st.speakDirections,
       hint: st.mode === "practice" && !st.readMine ? st.hint : "full",
-      listen: st.mode === "practice" && !st.readMine && st.listen && !!SR,
+      listen: st.mode === "practice" && !st.readMine && st.listen && HANDSFREE_SUPPORTED,
+      stt: st.stt && gtts.enabled(),
       showNotes: !!st.showNotes,
       others: [...st.others],
     });
@@ -2937,6 +3101,7 @@ VIEWS.setup = ({ id, scenes }) => {
     mineToggle.style.display = practice ? "" : "none";
     hintBox.style.display = practice ? "" : "none";
     listenToggle.style.display = practice ? "" : "none";
+    sttBox.style.display = (practice && st.listen && gtts.enabled()) ? "" : "none";
   }
 
   function render2() {
@@ -3127,71 +3292,72 @@ VIEWS.rehearse = (p) => {
 
   const isYouWait = l => l.role === "you" && p.mode === "practice" && !p.readMine;
 
-  // ---- hands-free listening ----
-  let recog = null, listening = false, recogRestarts = 0, silenceTimer = null;
-  function setListenDot(on, heard) {
-    const d = $("#listenDot");
-    if (!d) return;
-    d.textContent = on ? (heard ? "🎙 " + heard.slice(0, 26) : "🎙 lytter …") : "";
-  }
+  // ---- hands-free listening: mic voice-activity (offline) + optional Google STT ----
+  let hfFinished = false, hfBusy = false, hfFallback = null;
+  function setListenDot(txt) { const d = $("#listenDot"); if (d) d.textContent = txt || ""; }
   function stopListening() {
-    listening = false;
-    clearTimeout(silenceTimer);
-    setListenDot(false);
-    if (recog) { try { recog.onend = null; recog.abort(); } catch (e) {} recog = null; }
-    _activeRecog = null;
+    mic.disarm();
+    clearTimeout(hfFallback);
+    hfBusy = false;
+    setListenDot("");
+  }
+  function ensureHandsfree() {
+    if (!p.listen || !HANDSFREE_SUPPORTED) return;
+    requestWake();
+    if (mic.stream) return;
+    mic.open().then(ok => {
+      if (!ok) {
+        p.listen = false; setListenDot("");
+        toast("Ingen mikrofon-adgang — brug “Næste replik”");
+      } else if (waiting) {
+        startListening(cursor);
+      }
+    });
   }
   function startListening(idx) {
     stopListening();
-    if (!p.listen || !SR || !seq[idx]) return;
+    if (!p.listen || !mic.stream || !seq[idx]) return;
+    hfFinished = false;
     const target = normWords(seq[idx].text);
-    if (!target.length) return;
-    const tail = target.slice(-Math.min(3, target.length)).join(" ");
-    const need = Math.max(1, Math.round(target.length * 0.4));
-    const startedAt = Date.now();
-    const hardMs = Math.max(3500, target.length * 650);
-    let acc = "", lastAt = 0, gotSpeech = false, finished = false;
-    let r;
-    try { r = new SR(); } catch (e) { return; }
-    recog = r; _activeRecog = r; listening = true; recogRestarts = 0;
-    r.lang = "da-DK";
-    r.continuous = true;
-    r.interimResults = true;
-
-    const advance = () => {
-      if (finished || !waiting) return;
-      finished = true;
-      stopListening();
-      setTimeout(() => { if (waiting) deliverAndContinue(); }, 180);
-    };
-    const check = () => {
-      if (finished) return;
-      const hw = normWords(acc);
-      const hits = target.filter(w => hw.includes(w)).length;
-      if ((tail && hw.join(" ").includes(tail)) || hits >= need) return advance();
-      if (gotSpeech && hits >= 1 && lastAt && Date.now() - lastAt > 1400) return advance();
-      if (gotSpeech && Date.now() - startedAt > hardMs) return advance();
-    };
-
-    r.onspeechstart = () => { gotSpeech = true; };
-    r.onresult = e => {
-      for (let i = e.resultIndex; i < e.results.length; i++) acc += " " + e.results[i][0].transcript;
-      lastAt = Date.now(); gotSpeech = true;
-      setListenDot(true, normWords(acc).slice(-6).join(" "));
-      check();
-      clearTimeout(silenceTimer);
-      silenceTimer = setTimeout(check, 1500);
-    };
-    r.onspeechend = () => { setTimeout(check, 400); };
-    r.onerror = ev => {
-      const err = ev && ev.error;
-      if (err === "not-allowed" || err === "service-not-allowed") {
-        p.listen = false; stopListening();
-        toast("Mikrofon ikke tilladt — brug knappen “Næste replik”");
+    setListenDot("🎙 din tur");
+    mic.arm((pcm, sr) => handleUtterance(idx, target, pcm, sr));
+  }
+  function hfAdvance() {
+    if (hfFinished || !waiting) return;
+    hfFinished = true;
+    stopListening();
+    setTimeout(() => { if (waiting) deliverAndContinue(); }, 150);
+  }
+  async function handleUtterance(idx, target, pcm, sr) {
+    if (hfFinished || !waiting || hfBusy) return;
+    hfBusy = true;
+    if (!p.stt || !gtts.enabled()) { hfBusy = false; return hfAdvance(); }   // pure VAD
+    setListenDot("🎙 …");
+    clearTimeout(hfFallback);
+    hfFallback = setTimeout(() => { if (!hfFinished && waiting) { hfBusy = false; hfAdvance(); } }, 2200);
+    let transcript = "";
+    try { transcript = await googleSTT(pcm, sr); }
+    catch (e) {
+      clearTimeout(hfFallback);
+      if (e && (e.status === 401 || e.status === 403)) {
+        p.stt = false;
+        if (!speech._warned) { speech._warned = true; toast("Talegenkendelse ikke slået til i Google — kører videre når du taler"); }
       }
-    };
-    r.onend = () => { if (listening && !finished && recog === r && recogRestarts++ < 60) { try { r.start(); } catch (e) {} } };
-    try { r.start(); setListenDot(true); } catch (e) { listening = false; }
+      hfBusy = false; return hfAdvance();
+    }
+    clearTimeout(hfFallback);
+    if (hfFinished || !waiting) { hfBusy = false; return; }
+    const w = normWords(transcript);
+    const joined = " " + w.join(" ") + " ";
+    if (transcript) setListenDot("🎙 " + transcript.slice(0, 26));
+    if (w.length <= 3 && /\s(hjælp|hjaelp)\s/.test(joined)) {
+      hfBusy = false; mic.disarm(); setListenDot("🎙 …");
+      speech.say(seq[idx].text, voiceFor(seq[idx]), () => { if (waiting && !hfFinished) startListening(idx); });
+      return;
+    }
+    if (/\s(videre|næste|naeste|spring|skip)\s/.test(joined)) { hfBusy = false; return hfAdvance(); }
+    hfBusy = false;
+    hfAdvance();
   }
 
   function unmountTools() { const t = $("#hintTools"); if (t) t.remove(); }
@@ -3246,6 +3412,7 @@ VIEWS.rehearse = (p) => {
 
   function play() {
     speech.unlock();
+    ensureHandsfree();
     if (cursor >= seq.length - 1) restart();
     playing = true; waiting = false;
     renderPlayBtn();
@@ -3255,7 +3422,7 @@ VIEWS.rehearse = (p) => {
 
   // "Næste replik" (after your line) and "Næste ›" (read mode)
   function deliverAndContinue() {
-    speech.stop(); stopListening();
+    speech.stop(); stopListening(); ensureHandsfree();
     if (waiting) { revealLine(cursor); lineEls[cursor].classList.add("is-done"); waiting = false; }
     unmountTools();
     if (p.mode === "read") {
@@ -3632,9 +3799,8 @@ render();
 // keep iOS audio playback unlocked — every tap re-primes it (no-op once unlocked)
 ["pointerdown", "touchend", "click"].forEach(ev =>
   window.addEventListener(ev, () => speech.unlock(), { passive: true }));
-function killRecog() { if (_activeRecog) { try { _activeRecog.onend = null; _activeRecog.abort(); } catch (e) {} _activeRecog = null; } }
-window.addEventListener("pagehide", () => { speech.stop(); killRecog(); });
-document.addEventListener("visibilitychange", () => { if (document.hidden) { speech.stop(); killRecog(); } });
+window.addEventListener("pagehide", () => { speech.stop(); mic.close(); releaseWake(); });
+document.addEventListener("visibilitychange", () => { if (document.hidden) speech.stop(); });
 </script>
 
 </body>
