@@ -3619,7 +3619,10 @@ function scriptFileName(name) {
 function bundle(scripts) {
   return { app: "suffloer", version: 1, exported: new Date().toISOString(), scripts: JSON.parse(JSON.stringify(scripts)) };
 }
+// the Claude-artifact sandbox silently swallows downloads — fall back to copy there
+const canDownload = () => !/claudeusercontent|claude\.ai|anthropic/i.test(location.hostname);
 function downloadJSON(obj, filename) {
+  if (!canDownload()) return false;
   const json = JSON.stringify(obj, null, 2);
   try {
     const url = URL.createObjectURL(new Blob([json], { type: "application/json" }));
