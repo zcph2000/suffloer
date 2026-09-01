@@ -2624,6 +2624,17 @@ VIEWS.script = ({ id }) => {
     },
   }, ["▶  Øv hele manus"]));
 
+  if (gtts.enabled()) {
+    const off = el("p", { class: "muted-note", style: "margin-top:8px;cursor:pointer", onclick: () => go("voices", { id }) }, ["🎧  Tjekker offline-lyd …"]);
+    main.appendChild(off);
+    offlineStatus(s).then(st => {
+      if (!st.total) { off.remove(); return; }
+      const missing = st.total - st.have;
+      off.textContent = missing === 0 ? "🎧  Klar offline — al lyd er hentet" : `🎧  ${missing} replikker mangler til offline — tryk for at hente`;
+      if (missing === 0) off.style.color = "var(--good)";
+    });
+  }
+
   main.appendChild(el("div", { class: "stack", style: "margin-top:12px" }, s.scenes.map((sc, i) => {
     const lc = s.lines.filter(l => l.scene === i && l.kind === "dialogue").length;
     const who = [...new Set(s.lines.filter(l => l.scene === i && l.character).map(l => l.character))];
@@ -2871,6 +2882,52 @@ VIEWS.voices = ({ id }) => {
     }
   });
   main.appendChild(list);
+
+  // ---- prepare all audio for offline use ----
+  if (ai) {
+    main.appendChild(el("div", { class: "eyebrow", text: "Offline-lyd" }));
+    const card = el("div", { class: "card" });
+    const status = el("p", { class: "seg__hint", style: "margin:0 0 10px" }, ["Tjekker …"]);
+    const bar = el("div", { class: "progress", style: "display:none;margin-bottom:10px" }, [el("div", { class: "progress__fill", id: "prepFill" })]);
+    const btn = el("button", { class: "btn btn--primary" }, ["Forbered lyd"]);
+    card.appendChild(el("p", { class: "sub", style: "margin-top:0", text: "Hent alle de andre rollers replikker ned nu, så du kan øve helt uden net (fx i bilen)." }));
+    card.appendChild(status);
+    card.appendChild(bar);
+    card.appendChild(btn);
+    main.appendChild(card);
+
+    let running = false;
+    const refresh = async () => {
+      const st = await offlineStatus(s);
+      if (running) return;
+      if (!st.total) { status.textContent = "Ingen replikker med AI-stemme endnu."; btn.style.display = "none"; return; }
+      const missing = st.total - st.have;
+      status.textContent = missing === 0 ? `✓ Klar offline — alle ${st.total} replikker.` : `${st.have} / ${st.total} replikker klar.`;
+      status.style.color = missing === 0 ? "var(--good)" : "";
+      btn.style.display = missing === 0 ? "none" : "";
+      btn.textContent = st.have ? `Hent de sidste ${missing}` : "Forbered lyd";
+    };
+    btn.addEventListener("click", async () => {
+      if (running) { _prepAbort = true; return; }
+      running = true;
+      bar.style.display = "";
+      btn.textContent = "Stop";
+      btn.classList.add("btn--you");
+      status.style.color = "";
+      const res = await prepareOffline(s, (done, total) => {
+        status.textContent = `Henter … ${done} / ${total}`;
+        $("#prepFill").style.width = (100 * done / total) + "%";
+      });
+      running = false;
+      btn.classList.remove("btn--you");
+      bar.style.display = "none";
+      if (res.aborted) toast("Stoppet — du kan fortsætte senere");
+      else if (speech._gBlocked) showError((speech._lastGError || "").slice(0, 160), "AI-stemme afvist");
+      refresh();
+    });
+    refresh();
+  }
+
   main.appendChild(el("button", { class: "btn btn--ghost", style: "margin-top:16px", onclick: () => back() }, ["Færdig"]));
 };
 
@@ -3672,6 +3729,65 @@ function showError(msg, title = "Kunne ikke indlæse") {
 /* ---------------------------------------------------------------
    9. helpers that need store + nav
    --------------------------------------------------------------- */
+
+/* ---- offline audio: synthesise every spoken line up front ---- */
+// The merged dialogue units the rehearse engine will ask for (per whole script).
+function buildSpeechUnits(script) {
+  const vm = script.voiceMap || {};
+  const units = [];
+  let prev = null;
+  for (const l of script.lines) {
+    if (l._hidden || l.num || l.kind !== "dialogue") { prev = null; continue; }
+    if (prev && prev.character === l.character && l.cont) {
+      prev.text += (l.gap ? "\n\n" : "\n") + l.text;
+    } else {
+      const v = vm[l.character] || {};
+      prev = { character: l.character, text: l.text, gvoice: v.gvoice, rate: v.rate || 1, pitch: v.pitch ?? 1 };
+      units.push(prev);
+    }
+  }
+  return units.filter(u => u.gvoice && u.text.trim());
+}
+async function offlineStatus(script) {
+  const units = buildSpeechUnits(script);
+  if (!units.length) return { have: 0, total: 0 };
+  let have = 0;
+  for (const u of units) {
+    if (await audioCache.get(speech.cacheKey(u.text, u))) have++;
+  }
+  return { have, total: units.length };
+}
+let _prepAbort = false;
+async function prepareOffline(script, onProgress) {
+  _prepAbort = false;
+  autoAssignVoices(script, (script.characters || []).map(c => (typeof c === "string" ? c : c.name)));
+  store.save();
+  const units = buildSpeechUnits(script);
+  let done = 0, made = 0, failed = 0;
+  let wake = null;
+  try { navigator.wakeLock && navigator.wakeLock.request("screen").then(w => { wake = w; }, () => {}); } catch (e) {}
+  for (const u of units) {
+    if (_prepAbort || speech._gBlocked) break;
+    const ck = speech.cacheKey(u.text, u);
+    if (!(await audioCache.get(ck))) {
+      try {
+        audioCache.put(ck, await gtts.synth(u.text, u.gvoice, u.rate, u.pitch));
+        made++; failed = 0;
+        await new Promise(r => setTimeout(r, 140));
+      } catch (e) {
+        failed++;
+        if (failed >= 4) break;
+        await new Promise(r => setTimeout(r, 2500));
+        continue;
+      }
+    }
+    done++;
+    onProgress && onProgress(done, units.length, made);
+  }
+  try { if (wake) wake.release(); } catch (e) {}
+  return { done, total: units.length, made, aborted: _prepAbort };
+}
+
 function addScriptFromParse(parsed, title) {
   const script = {
     id: uid(), title, createdAt: Date.now(),
