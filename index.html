@@ -1409,11 +1409,17 @@ const gtts = {
   },
 };
 
+// tiny silent WAV to "unlock" the <audio> element inside a user gesture (iOS)
+const SILENT_WAV = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQQAAACAgICA";
+
 const speech = {
   voices: [],
   supported: "speechSynthesis" in window,
   _keepAlive: null,
-  _audio: null,
+  _audioEl: null,       // ONE reused element — a fresh Audio() per clip won't stay unlocked on iOS
+  _audioUnlocked: false,
+  _ttsUnlocked: false,
+  _curUrl: null,
   _token: 0,
   _warned: false,
   init() {
@@ -1424,6 +1430,29 @@ const speech = {
     setTimeout(load, 400);
     setTimeout(load, 1200);
   },
+  // MUST be called from inside a user gesture (button tap) to enable later auto-play on iOS
+  unlock() {
+    try {
+      if (!this._audioEl) {
+        this._audioEl = new Audio();
+        this._audioEl.setAttribute("playsinline", "");
+        this._audioEl.preload = "auto";
+      }
+      if (!this._audioUnlocked) {
+        this._audioEl.src = SILENT_WAV;
+        const p = this._audioEl.play();
+        if (p && p.then) p.then(() => { this._audioUnlocked = true; this._audioEl.pause(); }).catch(() => {});
+      }
+    } catch (e) {}
+    try {
+      if (this.supported && !this._ttsUnlocked) {
+        const u = new SpeechSynthesisUtterance(" ");
+        u.volume = 0;
+        speechSynthesis.speak(u);
+        this._ttsUnlocked = true;
+      }
+    } catch (e) {}
+  },
   danish() { return this.voices.filter(v => /^da(-|_|$)/i.test(v.lang)); },
   pool() {
     const da = this.danish();
@@ -1432,7 +1461,8 @@ const speech = {
   byURI(uri) { return this.voices.find(v => v.voiceURI === uri); },
   stop() {
     this._token++;
-    if (this._audio) { try { this._audio.pause(); this._audio.src = ""; } catch (e) {} this._audio = null; }
+    if (this._audioEl) { try { this._audioEl.pause(); } catch (e) {} }
+    if (this._curUrl) { try { URL.revokeObjectURL(this._curUrl); } catch (e) {} this._curUrl = null; }
     if (this.supported) { try { speechSynthesis.cancel(); } catch (e) {} }
     clearInterval(this._keepAlive); this._keepAlive = null;
   },
@@ -1461,13 +1491,32 @@ const speech = {
       if (token !== this._token) return;                 // superseded by a newer say/stop
       const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
       const url = URL.createObjectURL(new Blob([bytes], { type: "audio/mpeg" }));
-      const a = new Audio(url);
+      if (!this._audioEl) { this._audioEl = new Audio(); this._audioEl.setAttribute("playsinline", ""); }
+      const a = this._audioEl;
+      if (this._curUrl) { try { URL.revokeObjectURL(this._curUrl); } catch (e) {} }
+      this._curUrl = url;
+      a.src = url;
       try { a.playbackRate = clamp(opt.speed ?? 1, 0.5, 2); } catch (e) {}
-      this._audio = a;
       let done = false;
-      const fin = () => { if (done) return; done = true; try { URL.revokeObjectURL(url); } catch (e) {} if (token === this._token) { this._audio = null; onend && onend(); } };
-      a.onended = fin; a.onerror = fin;
-      await a.play();
+      const fin = () => {
+        if (done) return; done = true;
+        a.onended = null; a.onerror = null;
+        if (this._curUrl === url) { try { URL.revokeObjectURL(url); } catch (e) {} this._curUrl = null; }
+        if (token === this._token) onend && onend();
+      };
+      a.onended = fin;
+      a.onerror = fin;
+      try {
+        await a.play();
+        this._audioUnlocked = true;
+      } catch (pe) {
+        // audio was fetched fine but iOS blocked playback (no gesture) → this line only, no backoff
+        a.onended = null; a.onerror = null;
+        if (token !== this._token) return;
+        if (!this._warned) { this._warned = true; toast("Tryk én gang for at aktivere AI-lyd"); }
+        this._sayWeb(text, opt, onend);
+      }
+      return;
     } catch (e) {
       const m = this._lastGError = (e && e.message) || "ukendt fejl";
       if (e && e.badVoice && opt.gvoice) {
@@ -3022,13 +3071,15 @@ VIEWS.rehearse = (p) => {
   const isYouWait = l => l.role === "you" && p.mode === "practice" && !p.readMine;
 
   // ---- hands-free listening ----
-  let recog = null, listening = false, recogRestarts = 0;
-  function setListenDot(on) {
+  let recog = null, listening = false, recogRestarts = 0, silenceTimer = null;
+  function setListenDot(on, heard) {
     const d = $("#listenDot");
-    if (d) d.textContent = on ? "🎙 lytter …" : "";
+    if (!d) return;
+    d.textContent = on ? (heard ? "🎙 " + heard.slice(0, 26) : "🎙 lytter …") : "";
   }
   function stopListening() {
     listening = false;
+    clearTimeout(silenceTimer);
     setListenDot(false);
     if (recog) { try { recog.onend = null; recog.abort(); } catch (e) {} recog = null; }
     _activeRecog = null;
@@ -3037,25 +3088,44 @@ VIEWS.rehearse = (p) => {
     stopListening();
     if (!p.listen || !SR || !seq[idx]) return;
     const target = normWords(seq[idx].text);
-    if (target.length < 1) return;
-    const tail = target.slice(-3).join(" ");
-    const need = Math.max(2, Math.round(target.length * 0.55));
-    let acc = "";
+    if (!target.length) return;
+    const tail = target.slice(-Math.min(3, target.length)).join(" ");
+    const need = Math.max(1, Math.round(target.length * 0.4));
+    const startedAt = Date.now();
+    const hardMs = Math.max(3500, target.length * 650);
+    let acc = "", lastAt = 0, gotSpeech = false, finished = false;
     let r;
     try { r = new SR(); } catch (e) { return; }
     recog = r; _activeRecog = r; listening = true; recogRestarts = 0;
     r.lang = "da-DK";
     r.continuous = true;
     r.interimResults = true;
-    r.onresult = e => {
-      for (let i = e.resultIndex; i < e.results.length; i++) acc += " " + e.results[i][0].transcript;
+
+    const advance = () => {
+      if (finished || !waiting) return;
+      finished = true;
+      stopListening();
+      setTimeout(() => { if (waiting) deliverAndContinue(); }, 180);
+    };
+    const check = () => {
+      if (finished) return;
       const hw = normWords(acc);
       const hits = target.filter(w => hw.includes(w)).length;
-      if (hw.join(" ").includes(tail) || hits >= need) {
-        stopListening();
-        setTimeout(() => { if (waiting) deliverAndContinue(); }, 300);
-      }
+      if ((tail && hw.join(" ").includes(tail)) || hits >= need) return advance();
+      if (gotSpeech && hits >= 1 && lastAt && Date.now() - lastAt > 1400) return advance();
+      if (gotSpeech && Date.now() - startedAt > hardMs) return advance();
     };
+
+    r.onspeechstart = () => { gotSpeech = true; };
+    r.onresult = e => {
+      for (let i = e.resultIndex; i < e.results.length; i++) acc += " " + e.results[i][0].transcript;
+      lastAt = Date.now(); gotSpeech = true;
+      setListenDot(true, normWords(acc).slice(-6).join(" "));
+      check();
+      clearTimeout(silenceTimer);
+      silenceTimer = setTimeout(check, 1500);
+    };
+    r.onspeechend = () => { setTimeout(check, 400); };
     r.onerror = ev => {
       const err = ev && ev.error;
       if (err === "not-allowed" || err === "service-not-allowed") {
@@ -3063,7 +3133,7 @@ VIEWS.rehearse = (p) => {
         toast("Mikrofon ikke tilladt — brug knappen “Næste replik”");
       }
     };
-    r.onend = () => { if (listening && recog === r && recogRestarts++ < 40) { try { r.start(); } catch (e) {} } };
+    r.onend = () => { if (listening && !finished && recog === r && recogRestarts++ < 60) { try { r.start(); } catch (e) {} } };
     try { r.start(); setListenDot(true); } catch (e) { listening = false; }
   }
 
@@ -3118,6 +3188,7 @@ VIEWS.rehearse = (p) => {
   }
 
   function play() {
+    speech.unlock();
     if (cursor >= seq.length - 1) restart();
     playing = true; waiting = false;
     renderPlayBtn();
@@ -3442,6 +3513,9 @@ if (gtts.enabled() && !gtts.voices.length) {
   gtts.listVoices().catch(() => {});
 }
 render();
+// keep iOS audio playback unlocked — every tap re-primes it (no-op once unlocked)
+["pointerdown", "touchend", "click"].forEach(ev =>
+  window.addEventListener(ev, () => speech.unlock(), { passive: true }));
 function killRecog() { if (_activeRecog) { try { _activeRecog.onend = null; _activeRecog.abort(); } catch (e) {} _activeRecog = null; } }
 window.addEventListener("pagehide", () => { speech.stop(); killRecog(); });
 document.addEventListener("visibilitychange", () => { if (document.hidden) { speech.stop(); killRecog(); } });
