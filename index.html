@@ -1842,6 +1842,8 @@ backBtn.addEventListener("click", back);
 
 let _lastView = null;
 let prefetchToken = 0;
+let _walkAudio = null;
+let _walkCleanup = null;
 let _wakeLock = null;
 function requestWake() {
   try {
@@ -1856,7 +1858,9 @@ function render() {
   const scroller = document.scrollingElement || document.documentElement;
   const sameView = _lastView === nav.name;
   const keepY = sameView ? (window.scrollY || scroller.scrollTop || 0) : 0;
-  if (nav.name !== "rehearse") { mic.close(); releaseWake(); }
+  if (nav.name !== "rehearse") { mic.close(); }
+  if (nav.name !== "rehearse" && nav.name !== "walk") releaseWake();
+  if (nav.name !== "walk" && _walkCleanup) { _walkCleanup(); _walkCleanup = null; }
   prefetchToken++;
   // leaving work mode → flush edits and drop the live reference
   if (draft && draft._live && nav.name !== "work") { store.save(); draft = null; }
@@ -2968,10 +2972,58 @@ VIEWS.setup = ({ id, scenes }) => {
     el("button", { onclick: () => setMode("listen"), text: "Lyt" }),
     el("button", { onclick: () => setMode("read"), text: "Læs" }),
     el("button", { onclick: () => setMode("practice"), text: "Øv" }),
+    el("button", { onclick: () => setMode("walk"), text: "Gå-tur" }),
   ]);
   const segHint = el("p", { class: "seg__hint" });
   wrap.appendChild(seg);
   wrap.appendChild(segHint);
+
+  // Gå-tur options
+  st.walkVariant = "gaps";
+  st.gapFactor = store.data.settings.gapFactor || 1.3;
+  st.readTail = store.data.settings.readTail !== false;
+  const gapSlider = (() => {
+    const r = el("input", { type: "range", min: "0.5", max: "3", step: "0.1", value: String(st.gapFactor) });
+    const o = el("output", { text: st.gapFactor.toFixed(1) + "×" });
+    r.addEventListener("input", () => { st.gapFactor = +r.value; o.textContent = (+r.value).toFixed(1) + "×"; });
+    r.addEventListener("change", () => { store.data.settings.gapFactor = st.gapFactor; store.save(); });
+    return el("div", { class: "slider-row", style: "margin-top:6px" }, [
+      el("span", { style: "font-size:.7rem;letter-spacing:.06em;color:var(--ink-faint);width:34%", text: "PAUSENS LÆNGDE" }), r, o,
+    ]);
+  })();
+  const readTailToggle = el("label", { class: "toggle-row", style: "margin-top:8px" }, [
+    el("div", { class: "toggle-row__text" }, [
+      el("b", { text: "Læs min replik stille til sidst i pausen" }),
+      el("span", { text: "Så kan du fange den hvis du er gået i stå." }),
+    ]),
+    (() => {
+      const c = el("input", { type: "checkbox", class: "switch" });
+      c.checked = st.readTail;
+      c.addEventListener("change", () => { st.readTail = c.checked; store.data.settings.readTail = c.checked; store.save(); });
+      return c;
+    })(),
+  ]);
+  const walkBox = el("div", { style: "display:none" }, [
+    el("div", { class: "eyebrow", style: "margin-bottom:8px", text: "Gå-tur" }),
+    (() => {
+      const g = el("div", { class: "seg" }, [
+        el("button", { "aria-pressed": "false", onclick: () => setWalk("all"), text: "Alt læses højt" }),
+        el("button", { "aria-pressed": "true", onclick: () => setWalk("gaps"), text: "Pause til mine" }),
+      ]);
+      st._walkSeg = g;
+      return g;
+    })(),
+    el("p", { class: "seg__hint", text: "Samler scenen til én lydfil du kan låse telefonen og gå med. Tempoet kan justeres undervejs." }),
+    gapSlider,
+    readTailToggle,
+  ]);
+  wrap.appendChild(walkBox);
+  function setWalk(v) {
+    st.walkVariant = v;
+    [...st._walkSeg.children].forEach((b, i) => b.setAttribute("aria-pressed", String(["all", "gaps"][i] === v)));
+    gapSlider.style.display = v === "gaps" ? "" : "none";
+    readTailToggle.style.display = v === "gaps" ? "" : "none";
+  }
 
   const mineToggle = el("label", { class: "toggle-row" }, [
     el("div", { class: "toggle-row__text" }, [
@@ -3063,6 +3115,14 @@ VIEWS.setup = ({ id, scenes }) => {
     if (!chosen.length) { toast("Vælg mindst én scene"); return; }
     autoAssignVoices(s, s.characters.map(c => c.name));
     store.save();
+    if (st.mode === "walk") {
+      walkCtx();   // resume AudioContext inside this tap
+      go("walk", {
+        id, scenes: chosen.slice(),
+        variant: st.walkVariant, gapFactor: st.gapFactor, readTail: st.readTail,
+      });
+      return;
+    }
     go("rehearse", {
       id,
       scenes: chosen.slice(),
@@ -3091,17 +3151,22 @@ VIEWS.setup = ({ id, scenes }) => {
 
   function setMode(m) {
     st.mode = m;
-    [...seg.children].forEach((b, i) => b.setAttribute("aria-pressed", String(["listen", "read", "practice"][i] === m)));
+    [...seg.children].forEach((b, i) => b.setAttribute("aria-pressed", String(["listen", "read", "practice", "walk"][i] === m)));
     segHint.textContent = m === "listen"
       ? "Alt læses højt — også dine replikker. Læn dig tilbage og lyt."
       : m === "read"
         ? "Ingen lyd. Bladr igennem i dit eget tempo."
-        : "De andre roller læses højt. Appen stopper og venter ved dine replikker.";
+        : m === "walk"
+          ? "Én lang lydfil du kan låse telefonen og gå med — se valg nedenfor."
+          : "De andre roller læses højt. Appen stopper og venter ved dine replikker.";
     const practice = m === "practice";
     mineToggle.style.display = practice ? "" : "none";
     hintBox.style.display = practice ? "" : "none";
     listenToggle.style.display = practice ? "" : "none";
     sttBox.style.display = (practice && st.listen && gtts.enabled()) ? "" : "none";
+    dirToggle.style.display = (m === "read" || m === "walk") ? "none" : "";
+    walkBox.style.display = m === "walk" ? "" : "none";
+    startBtn.textContent = m === "walk" ? "🎧  Byg lyd & afspil" : "▶  Start";
   }
 
   function render2() {
@@ -3120,7 +3185,112 @@ VIEWS.setup = ({ id, scenes }) => {
 
   render2();
   setHint(st.hint);
+  setWalk(st.walkVariant);
   setMode("practice");
+};
+
+/* ---------- Gå-tur player (one continuous file, survives screen-lock) ---------- */
+VIEWS.walk = (p) => {
+  const s = store.script(p.id);
+  if (!s) { go("library", {}, { push: false }); return; }
+  topTitle.textContent = s.title;
+  backBtn.hidden = false;
+  requestWake();
+
+  const sceneNames = p.scenes.map(i => s.scenes[i] && s.scenes[i].title).filter(Boolean).join(" · ");
+  main.appendChild(el("h2", { class: "screen-title", text: "Gå-tur" }));
+  main.appendChild(el("p", { class: "lede", text: sceneNames || "Valgte scener" }));
+
+  const statusWrap = el("div", { class: "card", style: "text-align:center;padding:26px 16px" });
+  const statusTxt = el("p", { class: "sub", style: "margin:0 0 12px", text: "Bygger lydfil …" });
+  const bar = el("div", { class: "progress" }, [el("div", { class: "progress__fill", id: "walkFill" })]);
+  statusWrap.appendChild(statusTxt);
+  statusWrap.appendChild(bar);
+  main.appendChild(statusWrap);
+
+  if (_walkAudio) { try { _walkAudio.pause(); _walkAudio.src = ""; } catch (e) {} }
+  const audio = _walkAudio = new Audio();
+  audio.setAttribute("playsinline", "");
+  audio.preload = "auto";
+  let built = false, curUrl = null;
+
+  const player = el("div", { style: "display:none" });
+  main.appendChild(player);
+
+  const time = el("div", { class: "dock__meta", style: "margin-top:18px" }, [
+    el("span", { id: "wCur", text: "0:00" }),
+    el("span", { id: "wDur", text: "0:00" }),
+  ]);
+  const scrub = el("input", { type: "range", min: "0", max: "1000", value: "0", style: "width:100%;accent-color:var(--accent)" });
+  const bigPlay = el("button", { class: "dock__play", style: "margin-top:12px", text: "▶  Afspil" });
+  const back15 = el("button", { class: "icon-btn", "aria-label": "15 sek tilbage", text: "«15" });
+  const fwd15 = el("button", { class: "icon-btn", "aria-label": "15 sek frem", text: "15»" });
+  const rateVal = el("span", { id: "wRate", text: "" });
+  const rateRow = el("div", { class: "rate", style: "justify-content:center;margin-top:12px" }, [
+    el("button", { class: "icon-btn", text: "−", onclick: () => bumpRate(-0.1) }),
+    rateVal,
+    el("button", { class: "icon-btn", text: "+", onclick: () => bumpRate(0.1) }),
+  ]);
+  player.appendChild(time);
+  player.appendChild(scrub);
+  player.appendChild(el("div", { class: "dock__controls", style: "margin-top:12px" }, [back15, bigPlay, fwd15]));
+  player.appendChild(rateRow);
+  player.appendChild(el("button", { class: "btn btn--subtle", style: "margin-top:18px", onclick: () => go("setup", { id: p.id, scenes: p.scenes.length === s.scenes.length ? "all" : p.scenes }) }, ["‹  Andre valg"]));
+  player.appendChild(el("p", { class: "muted-note", style: "margin-top:14px" }, ["Du kan låse telefonen og lægge den i lommen — lyden kører videre. Betjening findes også på låseskærmen."]));
+
+  let rate = store.data.settings.rate || 0.9;
+  const showRate = () => { rateVal.textContent = rate.toFixed(2).replace(/0$/, "") + "×"; audio.playbackRate = clamp(rate, 0.5, 2); };
+  function bumpRate(d) { rate = clamp(Math.round((rate + d) * 20) / 20, 0.5, 1.6); store.data.settings.rate = rate; store.save(); showRate(); }
+  const fmt = t => { t = Math.max(0, t | 0); return (t / 60 | 0) + ":" + String(t % 60).padStart(2, "0"); };
+
+  audio.addEventListener("loadedmetadata", () => { $("#wDur").textContent = fmt(audio.duration); });
+  audio.addEventListener("timeupdate", () => {
+    if (!audio.duration) return;
+    $("#wCur").textContent = fmt(audio.currentTime);
+    if (!scrub.matches(":active")) scrub.value = String(Math.round(1000 * audio.currentTime / audio.duration));
+  });
+  audio.addEventListener("play", () => { bigPlay.textContent = "❚❚  Pause"; });
+  audio.addEventListener("pause", () => { bigPlay.textContent = "▶  Afspil"; });
+  audio.addEventListener("ended", () => { bigPlay.textContent = "↻  Igen"; });
+  scrub.addEventListener("input", () => { if (audio.duration) audio.currentTime = audio.duration * (+scrub.value / 1000); });
+  bigPlay.addEventListener("click", () => { if (audio.ended) audio.currentTime = 0; audio.paused ? audio.play().catch(() => {}) : audio.pause(); });
+  back15.addEventListener("click", () => { audio.currentTime = Math.max(0, audio.currentTime - 15); });
+  fwd15.addEventListener("click", () => { audio.currentTime = Math.min(audio.duration || 0, audio.currentTime + 15); });
+
+  try {
+    if ("mediaSession" in navigator) {
+      navigator.mediaSession.metadata = new MediaMetadata({ title: (sceneNames || "Gå-tur"), artist: s.title, album: "Sufflør" });
+      navigator.mediaSession.setActionHandler("play", () => audio.play().catch(() => {}));
+      navigator.mediaSession.setActionHandler("pause", () => audio.pause());
+      navigator.mediaSession.setActionHandler("seekbackward", () => { audio.currentTime = Math.max(0, audio.currentTime - 15); });
+      navigator.mediaSession.setActionHandler("seekforward", () => { audio.currentTime = Math.min(audio.duration || 0, audio.currentTime + 15); });
+    }
+  } catch (e) {}
+
+  (async () => {
+    let res;
+    try {
+      res = await renderWalkAudio(s, {
+        sceneSet: new Set(p.scenes), variant: p.variant, gapFactor: p.gapFactor, readTail: p.readTail,
+      }, (done, total) => {
+        statusTxt.textContent = `Bygger lydfil … ${done} / ${total}`;
+        $("#walkFill").style.width = (100 * done / total) + "%";
+      });
+    } catch (e) {
+      statusTxt.textContent = e.message || "Kunne ikke bygge lyden.";
+      statusTxt.style.color = "var(--you-ink)";
+      return;
+    }
+    built = true; curUrl = res.url;
+    audio.src = res.url;
+    showRate();
+    statusWrap.style.display = "none";
+    player.style.display = "";
+    if (res.missing) toast(res.missing + " replikker manglede — kør Forbered lyd på wifi først");
+    audio.play().catch(() => { /* needs a tap */ });
+  })();
+
+  _walkCleanup = () => { try { audio.pause(); audio.src = ""; } catch (e) {} if (curUrl) { try { URL.revokeObjectURL(curUrl); } catch (e) {} curUrl = null; } if (_walkAudio === audio) _walkAudio = null; };
 };
 
 /* ---------- Rehearse engine ---------- */
@@ -3610,22 +3780,23 @@ function showError(msg, title = "Kunne ikke indlæse") {
    --------------------------------------------------------------- */
 
 /* ---- offline audio: synthesise every spoken line up front ---- */
-// The merged dialogue units the rehearse engine will ask for (per whole script).
-function buildSpeechUnits(script) {
+// The merged dialogue units the rehearse engine will ask for.
+// opts.sceneSet (Set of scene indices) limits it; opts.keepAll keeps units without a voice.
+function buildSpeechUnits(script, opts = {}) {
   const vm = script.voiceMap || {};
   const units = [];
   let prev = null;
   for (const l of script.lines) {
-    if (l._hidden || l.num || l.kind !== "dialogue") { prev = null; continue; }
+    if (l._hidden || l.num || l.kind !== "dialogue" || (opts.sceneSet && !opts.sceneSet.has(l.scene))) { prev = null; continue; }
     if (prev && prev.character === l.character && l.cont) {
       prev.text += (l.gap ? "\n\n" : "\n") + l.text;
     } else {
       const v = vm[l.character] || {};
-      prev = { character: l.character, text: l.text, gvoice: v.gvoice, rate: v.rate || 1, pitch: v.pitch ?? 1 };
+      prev = { character: l.character, scene: l.scene, text: l.text, gvoice: v.gvoice, rate: v.rate || 1, pitch: v.pitch ?? 1 };
       units.push(prev);
     }
   }
-  return units.filter(u => u.gvoice && u.text.trim());
+  return units.filter(u => u.text.trim() && (opts.keepAll || u.gvoice));
 }
 async function offlineStatus(script) {
   const units = buildSpeechUnits(script);
@@ -3665,6 +3836,98 @@ async function prepareOffline(script, onProgress) {
   }
   try { if (wake) wake.release(); } catch (e) {}
   return { done, total: units.length, made, aborted: _prepAbort };
+}
+
+/* ---- "gå-tur": render a whole scene into ONE continuous audio file
+        (survives screen-lock on iOS, plays with the phone in your pocket) ---- */
+const WALK_RATE = 16000;   // speech-quality mono
+let _walkCtx = null;
+function walkCtx() {
+  if (!_walkCtx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    _walkCtx = new AC();
+  }
+  try { _walkCtx.resume(); } catch (e) {}
+  return _walkCtx;
+}
+function b64ToArrayBuffer(b64) {
+  const bin = atob(b64);
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return u8.buffer;
+}
+async function decodeToMono16k(b64) {
+  const ctx = walkCtx();
+  const buf = await new Promise((res, rej) => {
+    const r = ctx.decodeAudioData(b64ToArrayBuffer(b64), res, rej);
+    if (r && r.then) r.then(res, rej);
+  });
+  const src = buf.getChannelData(0);
+  const ratio = buf.sampleRate / WALK_RATE;
+  const out = new Float32Array(Math.max(1, Math.floor(src.length / ratio)));
+  for (let i = 0; i < out.length; i++) out[i] = src[Math.floor(i * ratio)] || 0;
+  return out;
+}
+function floatToWav(samples, rate) {
+  const n = samples.length;
+  const buf = new ArrayBuffer(44 + n * 2);
+  const v = new DataView(buf);
+  const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); ws(8, "WAVE");
+  ws(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  ws(36, "data"); v.setUint32(40, n * 2, true);
+  let o = 44;
+  for (let i = 0; i < n; i++) { let x = Math.max(-1, Math.min(1, samples[i])); v.setInt16(o, x * 0x7fff, true); o += 2; }
+  return new Blob([buf], { type: "audio/wav" });
+}
+// opts: { sceneSet, variant:"all"|"gaps", gapFactor, readTail, speakDirections }
+async function renderWalkAudio(script, opts, onProgress) {
+  autoAssignVoices(script, (script.characters || []).map(c => (typeof c === "string" ? c : c.name)));
+  store.save();
+  const mine = script.myCharacter;
+  const units = buildSpeechUnits(script, { sceneSet: opts.sceneSet });
+  if (!units.length) throw new Error("Ingen replikker med AI-stemme i de valgte scener.");
+  const breath = new Float32Array(Math.round(WALK_RATE * 0.4));
+  const parts = [];
+  let missing = 0, i = 0;
+  for (const u of units) {
+    i++;
+    onProgress && onProgress(i, units.length);
+    const isMine = u.character === mine;
+    let clip = null;
+    const ck = speech.cacheKey(u.text, u);
+    let b64 = await audioCache.get(ck);
+    if (!b64) {
+      try { b64 = await gtts.synth(u.text, u.gvoice, u.rate, u.pitch); audioCache.put(ck, b64); }
+      catch (e) { missing++; }
+    }
+    if (b64) { try { clip = await decodeToMono16k(b64); } catch (e) { clip = null; missing++; } }
+
+    if (isMine && opts.variant === "gaps") {
+      const dur = clip ? clip.length : Math.round(WALK_RATE * Math.max(1.2, u.text.length / 13));
+      const gapLen = Math.round(dur * (opts.gapFactor || 1.3));
+      if (opts.readTail && clip) {
+        const sil = Math.max(0, gapLen - clip.length);
+        if (sil) parts.push(new Float32Array(sil));
+        const quiet = new Float32Array(clip.length);
+        for (let k = 0; k < clip.length; k++) quiet[k] = clip[k] * 0.35;
+        parts.push(quiet);
+      } else {
+        parts.push(new Float32Array(gapLen));
+      }
+    } else if (clip) {
+      parts.push(clip);
+    } else {
+      parts.push(new Float32Array(Math.round(WALK_RATE * 1.5)));
+    }
+    parts.push(breath);
+  }
+  let total = 0; parts.forEach(p => total += p.length);
+  const all = new Float32Array(total);
+  let off = 0; parts.forEach(p => { all.set(p, off); off += p.length; });
+  const url = URL.createObjectURL(floatToWav(all, WALK_RATE));
+  return { url, duration: total / WALK_RATE, missing, units: units.length };
 }
 
 function addScriptFromParse(parsed, title) {
