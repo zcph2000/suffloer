@@ -459,6 +459,19 @@
     100% { background: transparent; }
   }
   .work-scene--flash { animation: scene-flash 1.8s ease-out; border-radius: 8px; }
+  .preview-scene-break {
+    display: flex; align-items: center; gap: 7px;
+    margin: 12px -10px 8px; padding: 6px 10px;
+    border-top: 2px solid var(--border-strong);
+    font-family: var(--font-ui); font-size: .8rem; font-weight: 700;
+    letter-spacing: .06em; text-transform: uppercase; color: var(--ink);
+  }
+  .preview-scene-break:first-child { border-top: 0; margin-top: 0; }
+  .preview-scene-break .scene-item__num {
+    background: var(--accent); color: #fff; margin-top: 0;
+    border-radius: 6px; padding: 2px 7px; font-size: .78rem;
+  }
+  .preview-scene-break--flash { animation: scene-flash 1.8s ease-out; border-radius: 8px; }
   .work-line {
     display: grid;
     grid-template-columns: 1fr;
@@ -2257,6 +2270,7 @@ function render() {
   prefetchToken++;
   // leaving work mode → flush edits and drop the live reference
   if (draft && draft._live && nav.name !== "work") { store.save(); draft = null; }
+  if (nav.name !== "work" && nav.name !== "review") _flashScene = -1;
   closeSheet();
   dock.hidden = true;
   dock.innerHTML = "";
@@ -2591,7 +2605,7 @@ VIEWS.review = () => {
   });
   main.appendChild(sc);
   main.appendChild(el("p", { class: "muted-note", style: "margin-top:8px" },
-    ["Vil du dele en scene op et bestemt sted? Det gør du i næste skridt, hvor du kan trykke på en replik og sætte et scenskift."]));
+    ["Vil du dele en scene op et bestemt sted? Tryk på replikken i manus nedenfor og vælg „Ny scene her“ — så kommer der en scene-overskrift ind i teksten."]));
 
   // --- Preview ---
   main.appendChild(el("div", { class: "eyebrow", text: "Manus" }));
@@ -2603,8 +2617,25 @@ VIEWS.review = () => {
     }, ["✕  Fjern alle sidetal"]));
   }
   const prev = el("div", { class: "card", style: "padding:8px 10px" });
-  draft.lines.forEach(line => prev.appendChild(previewLine(line)));
+  let curScene = -1, flashBreak = null;
+  draft.lines.forEach(line => {
+    if (typeof line.scene === "number" && line.scene !== curScene) {
+      curScene = line.scene;
+      const scObj = draft.scenes[curScene];
+      const brk = el("div", { class: "preview-scene-break" }, [
+        el("span", { class: "scene-item__num", text: String(curScene + 1).padStart(2, "0") }),
+        el("span", { text: (scObj && scObj.title) || ("Scene " + (curScene + 1)) }),
+      ]);
+      if (curScene === _flashScene) { brk.classList.add("preview-scene-break--flash"); flashBreak = brk; }
+      prev.appendChild(brk);
+    }
+    prev.appendChild(previewLine(line));
+  });
   main.appendChild(prev);
+  if (flashBreak) {
+    setTimeout(() => flashBreak.scrollIntoView({ block: "center", behavior: "smooth" }), 40);
+    _flashScene = -1;
+  }
 
   main.appendChild(el("hr", { class: "divider" }));
   main.appendChild(el("button", {
