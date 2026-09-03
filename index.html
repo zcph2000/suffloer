@@ -2317,7 +2317,7 @@ VIEWS.review = () => {
   });
   main.appendChild(sc);
   main.appendChild(el("p", { class: "muted-note", style: "margin-top:8px" },
-    ["Vil du dele en scene op et bestemt sted? Det gør du i næste skridt, hvor du kan trykke på en replik og sætte et scenskift."]));
+    ["Vil du dele en scene op et bestemt sted? Tryk på replikken i manus nedenfor og vælg „Ny scene her“ — så kommer der en scene-overskrift ind i teksten."]));
 
   // --- Preview ---
   main.appendChild(el("div", { class: "eyebrow", text: "Manus" }));
@@ -2657,10 +2657,15 @@ VIEWS.script = ({ id }) => {
   })));
 
   main.appendChild(el("hr", { class: "divider" }));
-  main.appendChild(el("div", { class: "btn-row" }, [
-    el("button", { class: "btn btn--ghost", onclick: () => go("voices", { id }) }, ["🔊  Stemmer"]),
-    el("button", { class: "btn btn--ghost", onclick: () => exportScript(id) }, ["⬆  Del manus (fil)"]),
+  main.appendChild(el("div", { class: "stack" }, [
+    el("div", { class: "btn-row" }, [
+      el("button", { class: "btn btn--ghost", onclick: () => go("voices", { id }) }, ["🔊  Stemmer"]),
+      el("button", { class: "btn btn--ghost", onclick: () => exportScriptDoc(id) }, ["📄  Del til instruktør"]),
+    ]),
+    el("button", { class: "btn btn--subtle", onclick: () => exportScript(id) }, ["⬆  Del som Sufflør-fil (til din anden enhed)"]),
   ]));
+  main.appendChild(el("p", { class: "muted-note", style: "margin-top:6px" },
+    ["„Del til instruktør“ laver et læsbart dokument med manus og alle noter ud for de replikker de hører til — kan printes som PDF eller åbnes i Word."]));
   let armed = false;
   const delBtn = el("button", { class: "btn btn--subtle", style: "margin-top:10px", onclick: () => {
     if (!armed) { armed = true; delBtn.textContent = "Tryk igen for at slette"; delBtn.classList.add("btn--you"); return; }
@@ -4135,6 +4140,139 @@ function exportScript(id) {
   const b = bundle([s]);
   if (!downloadJSON(b, scriptFileName(s.title))) showCopyFallback(JSON.stringify(b, null, 2));
   else toast("Fil hentet — send den til din anden enhed");
+}
+/* ---- share a readable document (manuscript + notes) for a director ---- */
+const _esc = s => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+function docFileName(name) {
+  return ((name || "manus").replace(/[^\p{L}\p{N} _-]+/gu, "").trim().replace(/\s+/g, "_").slice(0, 60) || "manus") + "_med_noter.html";
+}
+function downloadText(text, filename, mime) {
+  if (!canDownload()) return false;
+  try {
+    const url = URL.createObjectURL(new Blob([text], { type: mime || "text/plain" }));
+    const a = document.createElement("a");
+    a.href = url; a.download = filename; a.style.display = "none";
+    document.body.appendChild(a); a.click();
+    setTimeout(() => { a.remove(); URL.revokeObjectURL(url); }, 1500);
+    return true;
+  } catch (e) { return false; }
+}
+function scriptDocHtml(s) {
+  const scenes = (s.scenes && s.scenes.length) ? s.scenes : [{ title: "Manus" }];
+  const notesByLine = {};
+  (s.notes || []).forEach(n => (notesByLine[n.lineId] = notesByLine[n.lineId] || []).push(n));
+  const totalNotes = (s.notes || []).length;
+  const roles = (s.characters || []).map(c => (c && c.name) || c).filter(Boolean);
+  const snip = t => { t = (t || "").replace(/\s+/g, " ").trim(); return t.length > 52 ? t.slice(0, 52) + "…" : t; };
+
+  let body = "";
+  const noteIndex = [];
+  scenes.forEach((sc, si) => {
+    const lines = s.lines.filter(l => (l.scene || 0) === si && !l.num);
+    if (!lines.length) return;
+    const scTitle = (sc && sc.title) || ("Scene " + (si + 1));
+    body += `<h2 class="scene"><span class="n">${String(si + 1).padStart(2, "0")}</span> ${_esc(scTitle)}</h2>\n`;
+    let prevCue = null;
+    lines.forEach(l => {
+      const notes = notesByLine[l.id] || [];
+      let inner;
+      if (l.kind === "dialogue" && l.character) {
+        const showCue = !(l.cont && prevCue === l.character);
+        prevCue = l.character;
+        inner = `<p class="ln">${showCue ? `<span class="cue">${_esc(l.character)}</span>` : ""}<span class="tx">${_esc(l.text)}</span></p>`;
+      } else {
+        prevCue = null;
+        inner = `<p class="stage">${_esc(l.text)}</p>`;
+      }
+      let notesHtml = "";
+      notes.forEach(n => {
+        noteIndex.push({ scene: scTitle, line: l.text, text: n.text });
+        notesHtml += `<aside class="note"><span class="note-anchor">Note til: &bdquo;${_esc(snip(l.text))}&ldquo;</span>${_esc(n.text)}</aside>`;
+      });
+      body += `<div class="row${notes.length ? " has-note" : ""}">${inner}${notesHtml}</div>\n`;
+    });
+  });
+
+  let indexHtml = "";
+  if (noteIndex.length) {
+    indexHtml = `<h2 class="scene">Alle noter (${noteIndex.length})</h2>\n<ol class="note-list">` +
+      noteIndex.map(x => `<li><b>${_esc(x.scene)}</b> &mdash; &bdquo;${_esc(snip(x.line))}&ldquo;<br>${_esc(x.text)}</li>`).join("") +
+      `</ol>`;
+  }
+
+  const css = `
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  html { background: #f4f4f4; }
+  body { max-width: 1150px; margin: 40px auto; padding: 32px 30px 80px;
+    background: #fff; border-radius: 4px; box-shadow: 0 1px 4px rgba(0,0,0,.12);
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Georgia, serif; color: #1b1b1b; }
+  header, h1, .row .ln, .row .stage, h2.scene, .note-list { max-width: 760px; }
+  h1 { font-size: 1.7rem; margin: 0 0 6px; }
+  .meta { color: #666; font-size: .9rem; margin: 2px 0; }
+  .hint { background: #fff7e0; border: 1px solid #eddba0; padding: 9px 13px; border-radius: 9px; margin-top: 14px; }
+  h2.scene { margin: 36px 0 12px; padding-top: 12px; border-top: 2px solid #cfcfcf;
+    font-size: 1rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; }
+  h2.scene .n { background: #7a2ea0; color: #fff; border-radius: 5px; padding: 1px 7px; font-size: .85em; margin-right: 4px; }
+  .row { margin: 0; }
+  .ln { margin: .55rem 0; }
+  .ln .cue { display: block; font-weight: 700; font-size: .78rem; letter-spacing: .05em; text-transform: uppercase; color: #555; }
+  .ln .tx { white-space: pre-wrap; }
+  .stage { font-style: italic; color: #666; margin: .55rem 0; }
+  .note { background: #fff3cf; border-left: 3px solid #e0b53a; padding: 8px 11px; margin: 6px 0 12px;
+    font-size: .92rem; line-height: 1.5; border-radius: 0 7px 7px 0; }
+  .note-anchor { display: block; font-size: .77rem; color: #8a6d1f; margin-bottom: 3px; }
+  .note-list li { margin-bottom: 11px; }
+  @media (min-width: 1000px) {
+    .row.has-note { display: grid; grid-template-columns: minmax(0, 760px) 320px; column-gap: 28px; align-items: start; }
+    .row.has-note .ln, .row.has-note .stage { grid-column: 1; }
+    .row.has-note .note { grid-column: 2; margin: 0 0 8px; }
+  }
+  .printbtn { position: fixed; top: 14px; right: 14px; z-index: 9; padding: 10px 16px; border: 0;
+    border-radius: 10px; background: #7a2ea0; color: #fff; font-size: .95rem; font-weight: 600;
+    cursor: pointer; box-shadow: 0 3px 12px rgba(0,0,0,.22); }
+  @media print {
+    .noprint { display: none !important; }
+    html { background: #fff; }
+    body { max-width: none; margin: 0; padding: 0; font-size: 11.5pt; color: #000;
+      background: #fff; box-shadow: none; border-radius: 0; }
+    header, h1, .row .ln, .row .stage, h2.scene, .note-list { max-width: none; }
+    h2.scene { break-after: avoid; }
+    .row, .note, li { break-inside: avoid; }
+    .row.has-note { display: block; }
+    .note { background: #f0f0f0; border-left: 3px solid #999; }
+  }`;
+
+  return `<!doctype html><html lang="da"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${_esc(s.title || "Manus")} &ndash; manus med noter</title>
+<style>${css}</style></head><body>
+<button class="noprint printbtn" onclick="window.print()">&#128424;&#65039;  Print / gem som PDF</button>
+<header>
+<h1>${_esc(s.title || "Manus")}</h1>
+<p class="meta">Bearbejdet manus med noter &middot; ${totalNotes} note${totalNotes === 1 ? "" : "r"} &middot; ${_esc(new Date().toLocaleDateString("da-DK"))}</p>
+${roles.length ? `<p class="meta">Roller: ${_esc(roles.join(", "))}</p>` : ""}
+<p class="noprint hint">&Aring;bn filen i en browser og tryk &bdquo;Print / gem som PDF&ldquo; &mdash; eller &aring;bn den direkte i Word.</p>
+</header>
+${body}
+${indexHtml}
+</body></html>`;
+}
+function exportScriptDoc(id) {
+  const s = store.script(id);
+  if (!s) return;
+  const html = scriptDocHtml(s);
+  if (downloadText(html, docFileName(s.title), "text/html")) {
+    openSheet("Manus delt", el("div", {}, [
+      el("p", { class: "sub", text: "Filen er hentet. Send den til instruktøren — den åbnes i enhver browser (tryk „Print / gem som PDF“) og kan også åbnes direkte i Word." }),
+      el("button", { class: "btn btn--primary", style: "margin-top:12px", onclick: closeSheet }, ["Fint"]),
+    ]));
+  } else {
+    let w = null;
+    try { w = window.open("", "_blank"); } catch (e) {}
+    if (w) { w.document.write(html); w.document.close(); toast("Åbnet i ny fane — tryk Print / gem som PDF"); }
+    else showCopyFallback(html);
+  }
 }
 function exportAll() {
   if (!store.data.scripts.length) { toast("Ingen manus at kopiere"); return; }
