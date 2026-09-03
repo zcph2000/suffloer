@@ -998,9 +998,13 @@ function parseLines(input, opts = {}) {
         continue;
       }
       if (pend) {
-        pend.t = (pend.t + " " + t).replace(/\s+/g, " ").trim();
-        if (parenDepth(pend.t) === 0) { R.push(pend); pend = null; blank = false; }
-        continue;
+        const combined = (pend.t + " " + t).replace(/\s+/g, " ").trim();
+        if (parenDepth(combined) === 0) { pend.t = combined; R.push(pend); pend = null; blank = false; continue; }
+        pend._rows = (pend._rows || 1) + 1;
+        if (pend._rows <= 3 && pend.t.length < 320) { pend.t = combined; continue; }
+        // parens never balanced (malformed extraction) — stop swallowing, parse the rest normally
+        R.push(pend); pend = null; blank = false;
+        // fall through to handle current row t
       }
       const row = { t, nx: r.nx, blankBefore: blank };
       if (t[0] === "(" && parenDepth(t) > 0) { pend = row; blank = false; continue; }
@@ -1013,17 +1017,91 @@ function parseLines(input, opts = {}) {
   const CAPS_STOPWORDS = new Set([
     "PAUSE", "TÆPPE", "TÆPPEFALD", "SORT", "BLACKOUT", "MØRKE", "LYS", "SLUT", "TAK",
     "STILHED", "FORTSÆTTES", "SCENESKIFT", "MUSIK", "STOP", "END", "SLUTNING", "FINALE",
+    "PROLOG", "EPILOG", "INTERMEZZO", "MELLEMSPIL", "FORSPIL", "EFTERSPIL",
   ]);
+  const reEsc = x => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+  // Some scripts write the cue INLINE with no colon and no line break:
+  //   "ISAK Jeg var bange – ISMAIL Jeg var bange – ISAK og ISMAIL i kor Som om jeg …"
+  // Detect the recurring ALL-CAPS names, then split those rows into cue/line pieces.
+  let CAST_GROUPS = new Set();
+  let CAST_NAMES = new Set();
+  {
+    const allText = R.map(r => r.t).join("  ");
+    const freq = new Map();
+    let mm;
+    const tokRe = /(^|[^\p{L}])(\p{Lu}[\p{Lu}\d]{1,14})(?=[^\p{L}]|$)/gu;
+    while ((mm = tokRe.exec(allText))) freq.set(mm[2], (freq.get(mm[2]) || 0) + 1);
+    const castNames = [...freq].filter(([tok, n]) =>
+      n >= 3 && tok.length >= 3 && !CAPS_STOPWORDS.has(tok) &&
+      !/^[IVXLC]+$/.test(tok) && !isHeading(tok),
+    ).map(([tok]) => tok);
+    CAST_NAMES = new Set(castNames);
+
+    if (castNames.length >= 2) {
+      const nameAlt = castNames.map(reEsc).join("|");
+      const groupScanRe = new RegExp("(?:" + nameAlt + ")(?:\\s*(?:,|&|og)\\s+(?:" + nameAlt + "|\\p{Lu}{3,14}))+(?:\\s+i\\s+kor)?", "gu");
+      const groupPhrases = [...new Set((allText.match(groupScanRe) || []).map(x => x.replace(/\s+/g, " ").trim()))]
+        .sort((a, b) => b.length - a.length);
+      CAST_GROUPS = new Set(groupPhrases);
+      const tokens = [...groupPhrases, ...castNames.slice().sort((a, b) => b.length - a.length)];
+      const splitRe = new RegExp("(^|[\\s–—-])(" + tokens.map(reEsc).join("|") + ")(?=\\s)", "gu");
+
+      const rowHits = txt => {
+        splitRe.lastIndex = 0;
+        let c = 0, x;
+        while ((x = splitRe.exec(txt))) { c++; if (splitRe.lastIndex === x.index) splitRe.lastIndex++; if (c >= 2) break; }
+        return c;
+      };
+      if (R.some(r => rowHits(r.t) >= 2)) {
+        const splitRow = txt => {
+          splitRe.lastIndex = 0;
+          const hits = [];
+          let x;
+          while ((x = splitRe.exec(txt))) {
+            hits.push({ at: x.index + x[1].length, end: x.index + x[0].length, name: x[2] });
+            if (splitRe.lastIndex === x.index) splitRe.lastIndex++;
+          }
+          if (!hits.length) return null;
+          // pull inline noise out of a text chunk into its own pieces:
+          //   parentheticals, "(16)"/"(29B)" cue numbers, lone letter marks, EPILOG/PROLOG
+          const explode = chunk => chunk
+            .split(/(\([^)]*\)|(?:^|\s)[A-ZÆØÅ]{1,3}(?:\s*,\s*[A-ZÆØÅ]{1,3})*(?=\s|$)|(?:^|\s)(?:EPILOG|PROLOG|MELLEMSPIL)\.?(?=\s|$))/g)
+            .map(x => (x || "").trim().replace(/^[–—-]\s*/, "").replace(/^synger\s+/i, ""))
+            .filter(Boolean);
+          const out = [];
+          explode(txt.slice(0, hits[0].at)).forEach(x => out.push(x));
+          for (let k = 0; k < hits.length; k++) {
+            out.push(hits[k].name);
+            const end = k + 1 < hits.length ? hits[k + 1].at : txt.length;
+            explode(txt.slice(hits[k].end, end)).forEach(x => out.push(x));
+          }
+          return out.length > 1 ? out : null;
+        };
+        const isBareCaps = x => /^[\p{Lu}][\p{Lu}\d .'’-]{0,30}$/u.test(x) && !/[a-zæøå]/.test(x);
+        const R2 = [];
+        for (const r of R) {
+          if (isBareCaps(r.t) || CAST_GROUPS.has(r.t)) { R2.push(r); continue; }
+          const sp = splitRow(r.t);
+          if (!sp) { R2.push(r); continue; }
+          sp.forEach((piece, k) => R2.push({ t: piece, nx: r.nx, blankBefore: k === 0 ? r.blankBefore : false }));
+        }
+        R.length = 0; R.push(...R2);
+      }
+    }
+  }
+  // single musical / rehearsal marks scattered in the text: "C, D, E, F", "(16)", "G"
+  const isMusicMark = s => /^\(?\d{1,3}[A-Z]?\)?$/.test(s) || /^[A-ZÆØÅ]{1,3}(\s*,\s*[A-ZÆØÅ]{1,3}){0,7}\.?$/.test(s) || /^\*{2,}$/.test(s);
   const isCapsName = s =>
     s === s.toUpperCase() && /[A-ZÆØÅ]/.test(s) && !/[a-zæøå]/.test(s) &&
     s.length <= 34 && !/[&,;]/.test(s) &&
     !/(^|\s)(OG|AND|MED|SAMMEN)(\s|$)/.test(s) &&
     wordCount(normName(s)) <= 4 && !isHeading(s) && RE_CUE_SOLO.test(s);
 
-  // A shared cue: "ISAK & ISMAIL", "ISAK OG ISMAIL i kor" …
-  const RE_GROUP = /^([\p{Lu}][\p{Lu}. '’-]{1,20}(?:\s*(?:&|OG)\s*[\p{Lu}][\p{Lu}. '’-]{1,20})+)(?:\s+[iI]\s+kor|\s+sammen|\s+unisont|\s+samtidig[t]?)?\s*[:.]?\s*$/u;
-  const isGroupCue = s => RE_GROUP.test(s) && !isHeading(s);
-  const groupName = s => ((s.match(RE_GROUP) || [, ""])[1] || "").replace(/\s+/g, " ").trim();
+  // A shared cue: "ISAK & ISMAIL", "ISAK OG ISMAIL i kor", "SARA, HAGAR og ORKESTER i kor" …
+  const RE_GROUP = /^([\p{Lu}][\p{Lu}\d. '’-]{1,20}(?:\s*(?:&|OG|og|,)\s*[\p{Lu}][\p{Lu}\d. '’-]{1,20})+)(?:\s+[iI]\s+kor|\s+sammen|\s+unisont|\s+samtidig[t]?|\s+synger[^.]*)?\s*[:.]?\s*$/u;
+  const isGroupCue = s => (CAST_GROUPS.has(s) || RE_GROUP.test(s)) && !isHeading(s);
+  const groupName = s => CAST_GROUPS.has(s) ? s : ((s.match(RE_GROUP) || [, ""])[1] || "").replace(/\s+/g, " ").trim();
 
   // Bare page / line numbers picked up from the margins.
   const isPageNumber = s => /^[\s.·\-–—]*\d{1,4}[\s.·\-–—]*$/.test(s);
@@ -1056,8 +1134,11 @@ function parseLines(input, opts = {}) {
       if (nxt && !isHeading(nxt) && !isCapsName(nxt)) soloVotes++;
     }
   }
-  const knownCaps = new Set([...capsFreq].filter(([, n]) => n >= 2).map(([k]) => k));
-  const useSolo = !!opts.forceSolo || soloVotes >= 2 || knownCaps.size >= 1;
+  const knownCaps = new Set([
+    ...[...capsFreq].filter(([, n]) => n >= 2).map(([k]) => k),
+    ...[...CAST_NAMES].map(k => k.toUpperCase()),
+  ]);
+  const useSolo = !!opts.forceSolo || soloVotes >= 2 || knownCaps.size >= 1 || CAST_NAMES.size >= 2;
   const useInline = inlineVotes >= 1;
 
   const isCue = s => {
@@ -1089,6 +1170,13 @@ function parseLines(input, opts = {}) {
 
     // Bare page / line number from the margin → its own (deletable) stage line
     if (isPageNumber(s)) {
+      add({ kind: "action", text: s, num: true });
+      prevEmit = null;
+      continue;
+    }
+
+    // Musical / rehearsal marks: "(16)", "C, D, E, F", "***"  →  deletable stage line, keeps the speaker
+    if (isMusicMark(s)) {
       add({ kind: "action", text: s, num: true });
       prevEmit = null;
       continue;
