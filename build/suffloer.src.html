@@ -433,16 +433,32 @@
 
   /* ---------- work mode: readable script + margin notes ---------- */
   .work-scene-title {
-    width: 100%;
+    flex: 1; min-width: 0;
     font-family: var(--font-ui);
-    font-size: .74rem; font-weight: 700;
-    letter-spacing: .12em; text-transform: uppercase;
-    color: var(--ink-muted);
-    background: transparent; border: 0; padding: 0;
-    border-bottom: 1px dashed var(--border);
+    font-size: .9rem; font-weight: 700;
+    letter-spacing: .06em; text-transform: uppercase;
+    color: var(--ink);
+    background: transparent; border: 0; padding: 4px 0;
+    border-bottom: 1px dashed var(--border-strong);
   }
-  .work-scene { margin: 22px 0 6px; display: flex; align-items: baseline; gap: 8px; }
-  .work-scene .icon-btn { width: 30px; height: 30px; font-size: .9rem; }
+  .work-scene-title:focus { outline: none; border-bottom-color: var(--accent); border-bottom-style: solid; }
+  .work-scene {
+    margin: 30px 0 8px; padding-top: 12px;
+    display: flex; align-items: center; gap: 8px;
+    border-top: 2px solid var(--border-strong);
+  }
+  .work-scene:first-child { margin-top: 8px; border-top: 0; padding-top: 0; }
+  .work-scene .scene-item__num {
+    background: var(--accent); color: #fff; margin-top: 0;
+    border-radius: 6px; padding: 2px 7px; font-size: .78rem; font-weight: 700;
+  }
+  .work-scene .icon-btn { width: 30px; height: 30px; font-size: .9rem; flex: none; }
+  .work-scene__edit { flex: none; color: var(--ink-faint); font-size: .95rem; background: none; border: 0; cursor: pointer; padding: 4px; }
+  @keyframes scene-flash {
+    0%   { background: color-mix(in srgb, var(--accent) 32%, transparent); }
+    100% { background: transparent; }
+  }
+  .work-scene--flash { animation: scene-flash 1.8s ease-out; border-radius: 8px; }
   .work-line {
     display: grid;
     grid-template-columns: 1fr;
@@ -2217,6 +2233,7 @@ function back() {
 backBtn.addEventListener("click", back);
 
 let _lastView = null;
+let _flashScene = -1;
 let prefetchToken = 0;
 let _walkAudio = null;
 let _walkCleanup = null;
@@ -2766,6 +2783,9 @@ function setSceneBreakAt(idx) {
     else draft.lines[i].scene += 1;
   }
   renumberScenes();
+  _flashScene = curScene + 1;
+  touch();
+  toast("Ny scene oprettet — tryk på titlen for at navngive den");
 }
 
 function mergeSceneUp(i) {
@@ -2957,21 +2977,36 @@ VIEWS.work = ({ id }) => {
 
     const titleInput = el("input", {
       class: "work-scene-title", type: "text", value: scene.title,
-      "aria-label": "Scenetitel",
+      "aria-label": "Scenetitel", placeholder: "Scene " + (si + 1),
     });
-    titleInput.addEventListener("change", () => {
+    const commitTitle = () => {
       scene.title = titleInput.value.trim() || ("Scene " + (si + 1));
+      titleInput.value = scene.title;
       touch();
-    });
+    };
+    titleInput.addEventListener("change", commitTitle);
+    titleInput.addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); titleInput.blur(); } });
     const sceneRow = el("div", { class: "work-scene" }, [
       el("span", { class: "scene-item__num", text: String(si + 1).padStart(2, "0") }),
       titleInput,
+      el("button", {
+        class: "work-scene__edit", "aria-label": "Omdøb scene", title: "Omdøb scene", text: "✎",
+        onclick: () => { titleInput.focus(); titleInput.select(); },
+      }),
       si > 0 ? el("button", {
         class: "icon-btn", "aria-label": "Slå sammen med forrige scene", title: "Slå sammen med forrige", text: "⇧",
         onclick: () => { mergeSceneUp(si); render(); },
       }) : null,
     ]);
     body.appendChild(sceneRow);
+    if (si === _flashScene) {
+      sceneRow.classList.add("work-scene--flash");
+      setTimeout(() => {
+        sceneRow.scrollIntoView({ block: "center", behavior: "smooth" });
+        sceneRow.addEventListener("animationend", () => sceneRow.classList.remove("work-scene--flash"), { once: true });
+      }, 40);
+      _flashScene = -1;
+    }
 
     let prevLine = null;
     sceneLines.forEach(l => {
